@@ -21,6 +21,7 @@ pub struct RenderRequest<'a> {
     pub context: &'a serde_json::Value,
     pub font_bytes: &'a [u8],
     pub assets: BTreeMap<String, Arc<Vec<u8>>>,
+    pub require_direct_palette: bool,
 }
 
 pub struct RenderResult {
@@ -49,7 +50,7 @@ pub fn render(request: RenderRequest<'_>) -> Result<RenderResult> {
         .context("render Liquid template to SVG text")?;
 
     let asset_ids = request.assets.keys().cloned().collect();
-    validate_svg(&svg, &asset_ids)?;
+    validate_svg(&svg, &asset_ids, request.require_direct_palette)?;
 
     let mut fontdb = usvg::fontdb::Database::new();
     fontdb.load_font_data(request.font_bytes.to_vec());
@@ -119,7 +120,11 @@ pub fn render(request: RenderRequest<'_>) -> Result<RenderResult> {
     })
 }
 
-fn validate_svg(svg: &str, declared_assets: &BTreeSet<String>) -> Result<()> {
+fn validate_svg(
+    svg: &str,
+    declared_assets: &BTreeSet<String>,
+    require_direct_palette: bool,
+) -> Result<()> {
     let document = usvg::roxmltree::Document::parse(svg).context("parse SVG XML for allowlist")?;
     let root = document.root_element();
     ensure!(root.tag_name().name() == "svg", "root element must be svg");
@@ -136,6 +141,16 @@ fn validate_svg(svg: &str, declared_assets: &BTreeSet<String>) -> Result<()> {
         root.attribute("viewBox") == Some("0 0 800 480"),
         "viewBox must be 0 0 800 480"
     );
+    if require_direct_palette {
+        ensure!(
+            root.attribute("shape-rendering") == Some("crispEdges"),
+            "root shape-rendering must be crispEdges"
+        );
+        ensure!(
+            root.attribute("text-rendering") == Some("optimizeSpeed"),
+            "root text-rendering must disable antialiasing"
+        );
+    }
 
     let allowed_elements: BTreeSet<&str> = [
         "svg", "g", "defs", "clipPath", "rect", "circle", "ellipse", "line", "polyline", "polygon",
@@ -169,7 +184,9 @@ fn validate_svg(svg: &str, declared_assets: &BTreeSet<String>) -> Result<()> {
         "stroke-width",
         "stroke-linecap",
         "stroke-linejoin",
-        "opacity",
+        "shape-rendering",
+        "text-rendering",
+        "image-rendering",
         "font-family",
         "font-size",
         "font-weight",
@@ -216,6 +233,16 @@ fn validate_svg(svg: &str, declared_assets: &BTreeSet<String>) -> Result<()> {
                 } else {
                     bail!("href is only allowed on use and image");
                 }
+            }
+            if matches!(name, "fill" | "stroke") {
+                ensure!(
+                    matches!(
+                        attribute.value(),
+                        "none" | "#000000" | "#ffffff" | "#cd2323"
+                    ),
+                    "vector paint is outside the panel palette: {}",
+                    attribute.value()
+                );
             }
         }
     }
