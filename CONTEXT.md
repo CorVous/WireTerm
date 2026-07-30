@@ -67,3 +67,15 @@ An ordered collection of playlist items that the host cycles through on the conn
 ## Playlist item
 
 One independently configured entry in a playlist. An item selects a content source, such as one image, a random image from a collection, or an extension instance, and produces the frame for its turn in the cycle.
+
+## Extension capability
+
+A network host, named secret, or transform-execution privilege declared by an extension and granted independently to each playlist item. Undeclared capabilities are unavailable, and declaration changes require renewed approval.
+
+## Named secret
+
+A credential value stored and injected into declared HTTP requests by WireTerm under an extension-defined name. Extension templates, transforms, response data, logs, and errors may reference the name but never receive the value.
+
+## Transform
+
+An optional extension-local Lua function that reshapes non-secret inputs and named HTTP responses before template rendering. WireTerm supplies the Lua runtime and a data-only API; transforms cannot directly access files, processes, the environment, or the network.
