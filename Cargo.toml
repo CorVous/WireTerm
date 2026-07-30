@@ -32,8 +32,13 @@ harness = false
 [dependencies]
 anyhow = { version = "1.0.100", default-features = true }
 clap = { version = "4.5.53", features = ["derive"] }
+crc32fast = "1"
+eframe = "0.34"
 env_logger = { version = "0.11.8", default-features = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log = { version = "0.4.28", default-features = true }
+rfd = "0.15"
+serialport = "4"
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.17", default-features = true }
