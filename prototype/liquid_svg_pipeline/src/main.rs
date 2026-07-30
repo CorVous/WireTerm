@@ -1,5 +1,6 @@
 //! DISPOSABLE PROTOTYPE SHELL — not production code.
 
+mod frame_preview;
 mod pipeline;
 
 use std::collections::BTreeMap;
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+use frame_preview::PreparedFrame;
 use pipeline::{HEIGHT, RenderRequest, RenderResult, WIDTH};
 
 const VARIANT_A_RGBA_SHA256: &str =
@@ -18,6 +20,19 @@ const VARIANT_B_RGBA_SHA256: &str =
     "a87ce35bde8ae077ee6146d7d0ec3b7f4b9ef4663c3b92e1037f8cef0f12b8c6";
 const VARIANT_B_PNG_SHA256: &str =
     "b1cd894647ff12f56181e9ebd46b99cb34a60429a29027d06fa278219c66a423";
+const VARIANT_A_FRAME_SHA256: &str =
+    "1e66db5dc8e1590cad197225e9182ae6a49225c6f851dadf8f89b0d022666787";
+const VARIANT_A_PREVIEW_SHA256: &str =
+    "28beed49bcbab97d9a15231d0b8a1b5158736fa0ef73b3aa64bbd65ada79775f";
+const VARIANT_B_FRAME_SHA256: &str =
+    "ac656ce2a6f661dfba7e200eb1e3ff8b07994e384da04189454bf185d7417f04";
+const VARIANT_B_PREVIEW_SHA256: &str =
+    "087e22b8b66e81f49f2f1074c44e0c175d648f7dc7349f6e4f285cee72447831";
+
+struct FixtureResult {
+    render: RenderResult,
+    frame: PreparedFrame,
+}
 
 fn main() -> Result<()> {
     let prototype_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -60,8 +75,10 @@ fn main() -> Result<()> {
         &output_root,
     )?;
 
-    verify_semantics(&variant_a, &variant_b)?;
-    verify_golden_hashes(&variant_a, &variant_b)?;
+    verify_semantics(&variant_a.render, &variant_b.render)?;
+    verify_golden_hashes(&variant_a.render, &variant_b.render)?;
+    verify_frame_semantics(&variant_a.frame, &variant_b.frame)?;
+    verify_frame_golden_hashes(&variant_a.frame, &variant_b.frame)?;
 
     let repeated_a = render_fixture(
         &fixtures_root.join("variant-a.json"),
@@ -71,21 +88,32 @@ fn main() -> Result<()> {
         Arc::new(fs::read(fixtures_root.join(asset_path))?),
     )?;
     ensure!(
-        variant_a.rgba == repeated_a.rgba,
+        variant_a.render.rgba == repeated_a.rgba,
         "variant A raw pixels changed between consecutive renders"
     );
     ensure!(
-        variant_a.png == repeated_a.png,
+        variant_a.render.png == repeated_a.png,
         "variant A PNG bytes changed between consecutive renders"
+    );
+    let repeated_frame_a = frame_preview::prepare_frame(&repeated_a.png)?;
+    ensure!(
+        variant_a.frame.payload == repeated_frame_a.payload,
+        "variant A frame payload changed between consecutive preparations"
+    );
+    ensure!(
+        variant_a.frame.preview_png == repeated_frame_a.preview_png,
+        "variant A e-paper preview PNG changed between consecutive preparations"
     );
 
     println!();
     println!("PASS: both disposable fixtures rendered meaningful {WIDTH} x {HEIGHT} output.");
-    println!("PASS: both fixtures matched the committed raw-pixel and PNG-byte goldens.");
-    println!("PASS: variant A repeated with identical raw pixels and PNG bytes.");
+    println!("PASS: both fixtures matched committed render, frame, and preview goldens.");
+    println!("PASS: both generated PNGs produced meaningful 96,000-byte B/W/R frames.");
+    println!("PASS: both e-paper preview PNGs decoded as exactly {WIDTH} x {HEIGHT}.");
+    println!("PASS: variant A repeated with identical render, frame, and preview bytes.");
     println!("Artifacts: {}", output_root.display());
     println!("Not proven: cross-platform hashes, future dependency stability, hostile-input");
-    println!("sandboxing, complete SVG/font coverage, or production pipeline integration.");
+    println!("sandboxing, optical panel fidelity, hardware output, or shared production code.");
 
     Ok(())
 }
@@ -104,6 +132,20 @@ fn verify_golden_hashes(variant_a: &RenderResult, variant_b: &RenderResult) -> R
     Ok(())
 }
 
+fn verify_frame_golden_hashes(variant_a: &PreparedFrame, variant_b: &PreparedFrame) -> Result<()> {
+    ensure!(
+        variant_a.payload_sha256 == VARIANT_A_FRAME_SHA256
+            && variant_a.preview_png_sha256 == VARIANT_A_PREVIEW_SHA256,
+        "variant A did not match its committed frame and preview golden hashes"
+    );
+    ensure!(
+        variant_b.payload_sha256 == VARIANT_B_FRAME_SHA256
+            && variant_b.preview_png_sha256 == VARIANT_B_PREVIEW_SHA256,
+        "variant B did not match its committed frame and preview golden hashes"
+    );
+    Ok(())
+}
+
 fn run_fixture(
     name: &str,
     context_path: &Path,
@@ -112,12 +154,18 @@ fn run_fixture(
     asset_path: &str,
     asset: Arc<Vec<u8>>,
     output_root: &Path,
-) -> Result<RenderResult> {
+) -> Result<FixtureResult> {
     let result = render_fixture(context_path, template, font, asset_path, asset)?;
+    let frame = frame_preview::prepare_frame(&result.png)?;
     fs::write(output_root.join(format!("{name}.svg")), &result.svg)
         .with_context(|| format!("write {name} rendered SVG"))?;
     fs::write(output_root.join(format!("{name}.png")), &result.png)
         .with_context(|| format!("write {name} PNG"))?;
+    fs::write(
+        output_root.join(format!("{name}-epaper-preview.png")),
+        &frame.preview_png,
+    )
+    .with_context(|| format!("write {name} e-paper preview PNG"))?;
 
     println!("fixture: {name}");
     println!("  dimensions: {WIDTH} x {HEIGHT}");
@@ -126,6 +174,13 @@ fn run_fixture(
     println!("  rgba sha256: {}", result.rgba_sha256);
     println!("  png  sha256: {}", result.png_sha256);
     println!(
+        "  frame palette: black={} white={} red={}",
+        frame.black_pixels, frame.white_pixels, frame.red_pixels
+    );
+    println!("  frame bytes: {}", frame.payload.len());
+    println!("  frame sha256: {}", frame.payload_sha256);
+    println!("  preview png sha256: {}", frame.preview_png_sha256);
+    println!(
         "  svg: {}",
         output_root.join(format!("{name}.svg")).display()
     );
@@ -133,8 +188,17 @@ fn run_fixture(
         "  png: {}",
         output_root.join(format!("{name}.png")).display()
     );
+    println!(
+        "  e-paper preview: {}",
+        output_root
+            .join(format!("{name}-epaper-preview.png"))
+            .display()
+    );
 
-    Ok(result)
+    Ok(FixtureResult {
+        render: result,
+        frame,
+    })
 }
 
 fn render_fixture(
@@ -219,6 +283,25 @@ fn verify_semantics(variant_a: &RenderResult, variant_b: &RenderResult) -> Resul
         "Liquid loop rows were not meaningfully painted"
     );
 
+    Ok(())
+}
+
+fn verify_frame_semantics(variant_a: &PreparedFrame, variant_b: &PreparedFrame) -> Result<()> {
+    for (name, frame) in [("variant A", variant_a), ("variant B", variant_b)] {
+        ensure!(
+            frame.payload.len() == 96_000,
+            "{name} frame payload was not 96,000 bytes"
+        );
+        ensure!(
+            frame.black_pixels > 10_000 && frame.white_pixels > 300_000 && frame.red_pixels > 500,
+            "{name} did not produce a meaningful black/white/red frame"
+        );
+        ensure!(
+            frame.black_pixels + frame.white_pixels + frame.red_pixels
+                == WIDTH as usize * HEIGHT as usize,
+            "{name} palette counts did not cover the full frame"
+        );
+    }
     Ok(())
 }
 

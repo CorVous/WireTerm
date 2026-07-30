@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+image = { version = "=0.25.9", default-features = false, features = ["png"] }
 liquid = { version = "=0.26.11", default-features = false }
 liquid-lib = { version = "=0.26.11", default-features = false, features = ["stdlib"] }
 png = "=0.18.0"
