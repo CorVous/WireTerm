@@ -1,0 +1,15 @@
+{
+  "template": "template.svg.liquid",
+  "assets": {
+    "logo": "assets/logo.png"
+  },
+  "fonts": [
+    {
+      "family": "Inter",
+      "path": "fonts/Inter.ttf",
+      "license": "OFL-1.1",
+      "notice": "fonts/OFL.txt"
+    }
+  ]
+}
+

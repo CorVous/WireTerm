@@ -1,0 +1,22 @@
+{
+  "data": {
+    "title": "WireTerm & <SVG> 'prototype' \"A\"",
+    "show_image": true,
+    "rows": [
+      {
+        "y": 242,
+        "label": "First <row>",
+        "value": "17 & rising"
+      },
+      {
+        "y": 304,
+        "label": "Second \"row\"",
+        "value": "42 > 17"
+      }
+    ]
+  },
+  "settings": {
+    "branch": "left"
+  }
+}
+

@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+  <defs>
+    <clipPath id="content-clip">
+      <rect x="20" y="180" width="760" height="174"/>
+    </clipPath>
+    <g id="row-dot">
+      <circle cx="0" cy="-8" r="6" fill="#dc2626"/>
+    </g>
+  </defs>
+
+  <rect x="0" y="0" width="800" height="480" fill="#ffffff"/>
+  <rect x="8" y="8" width="784" height="464" fill="none" stroke="#111111" stroke-width="4"/>
+
+  <text x="36" y="62" font-family="Inter" font-size="30" font-weight="700" fill="#111111">
+    <tspan>{{ data.title | escape }}</tspan>
+  </text>
+
+  {% if settings.branch == "left" %}
+    <rect id="branch-left" x="280" y="96" width="120" height="38" fill="#dc2626"/>
+    <text x="340" y="122" font-family="Inter" font-size="18" font-weight="700" text-anchor="middle" fill="#ffffff">
+      <tspan>BRANCH A</tspan>
+    </text>
+  {% else %}
+    <rect id="branch-right" x="430" y="96" width="120" height="38" fill="#111111"/>
+    <text x="490" y="122" font-family="Inter" font-size="18" font-weight="700" text-anchor="middle" fill="#ffffff">
+      <tspan>BRANCH B</tspan>
+    </text>
+  {% endif %}
+
+  {% if data.show_image %}
+    <image id="declared-image" x="650" y="70" width="110" height="88"
+           preserveAspectRatio="xMidYMid meet" href="assets/logo.png"/>
+  {% endif %}
+
+  <g clip-path="url(#content-clip)">
+    {% for row in data.rows %}
+      <g id="row-{{ forloop.index }}" transform="translate(54 {{ row.y }})">
+        <use href="#row-dot"/>
+        <text x="24" y="0" font-family="Inter" font-size="24" fill="#111111">
+          <tspan>{{ row.label | escape }}</tspan>
+          <tspan x="670" text-anchor="end">{{ row.value | escape }}</tspan>
+        </text>
+        <line x1="24" y1="18" x2="670" y2="18" stroke="#111111" stroke-width="2" opacity="0.25"/>
+      </g>
+    {% endfor %}
+  </g>
+
+  <text x="400" y="430" font-family="Inter" font-size="17" text-anchor="middle" fill="#111111">
+    <tspan>Liquid emits text. usvg parses. resvg paints.</tspan>
+  </text>
+</svg>
+
