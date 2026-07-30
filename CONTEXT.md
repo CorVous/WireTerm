@@ -64,9 +64,21 @@ A reusable host-side content definition that produces display content from confi
 
 An ordered collection of playlist items that the host cycles through on the connected display.
 
+## Playlist revision
+
+One complete, valid saved state of the playlist. Playback adopts the latest playlist revision between playback turns; an active turn continues against the revision with which it began.
+
 ## Playlist item
 
 One independently configured entry in a playlist. An item selects a content source, such as one image, a random image from a collection, or an extension instance, and produces the frame for its turn in the cycle.
+
+## Playback turn
+
+One playlist item's passage from the start of refresh until its send completes and its item interval has elapsed. A playback turn remains current while the host process is running, including across a display-bridge disconnect, until it completes or fails and is skipped. A new host process begins a new cycle rather than recovering an interrupted turn.
+
+## Item interval
+
+The minimum start-to-start time assigned to a playlist item. Its timer begins when the item's playback turn starts; refresh, rendering, transfer, and panel refresh all consume the interval. The next turn starts after both the interval has elapsed and the current send has completed.
 
 ## Extension capability
 
