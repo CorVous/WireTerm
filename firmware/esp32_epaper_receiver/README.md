@@ -1,6 +1,6 @@
-# WireTerm ESP32 receiver safety prototype
+# WireTerm ESP32 display bridge
 
-This is a **throwaway, offline prototype** for an ESP32 DevKit V1 and Waveshare
+This is the maintained offline receiver for an ESP32 DevKit V1 and Waveshare
 7.5-inch e-Paper (B) V3 on a Driver HAT Rev2.3. Waveshare documents V3 as
 hardware/interface compatible with V2, so the panel sequence is based on the
 official `epd7in5b_V2` full-refresh driver family.
@@ -26,12 +26,15 @@ refresh. Wi-Fi and Bluetooth are explicitly disabled.
 ## Build and flash
 
 ```text
-cd prototype/esp32_epaper_receiver
+cd firmware/esp32_epaper_receiver
 pio run
 pio run -t upload --upload-port COM9
 ```
 
-## Conservative serial foundation
+`pio run` only compiles. Uploading and hardware diagnostics are intentional
+operator actions; the host application never invokes them.
+
+## WireTerm/1 serial contract
 
 USB serial is 115200 baud, newline-delimited ASCII, with a 127-byte line limit:
 

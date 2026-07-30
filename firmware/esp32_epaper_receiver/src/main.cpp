@@ -1,5 +1,5 @@
 /*
- * WireTerm offline ESP32 receiver prototype.
+ * WireTerm offline ESP32 display bridge firmware.
  * Accepts one complete CRC32-verified 800x480 B/W/R frame before refreshing.
  */
 

@@ -1,98 +1,77 @@
-# Rust Template
+# WireTerm
 
-Cassidy's opinionated Rust template. Enter at your own peril.
+WireTerm is a portable Windows 11 application for preparing and sending
+800 × 480 black/white/red frames to an offline ESP32 e-paper display bridge
+over USB serial.
 
-## Usage
+The current application is intentionally focused: choose one PNG or JPEG,
+inspect the prepared frame, choose a serial device, and send it. WireTerm runs
+only while its foreground window is open. It does not install a tray process,
+background player, startup task, updater, or system service.
 
-<!-- generated-usage:start -->
+## Run
+
+Install the stable Rust toolchain, then:
 
 ```text
-Cassidy's opinionated Rust template
-
-Usage: rust-template [OPTIONS] [COMMAND]
-
-Commands:
-  version  Display package version
-  example  Example subcommand (replace with your own)
-  help     Print this message or the help of the given subcommand(s)
-
-Options:
-  -v, --verbose...
-          Increase verbosity (can be repeated: -v, -vv, -vvv)
-
-  -h, --help
-          Print help
-
-  -V, --version
-          Print version
+cargo run
 ```
 
-<!-- generated-usage:end -->
+For a portable executable:
 
+```text
+cargo build --release
+```
 
-## Development
+Copy `target/release/wireterm.exe` wherever it should run. No installer or
+machine-wide configuration is required.
 
-Requires [Rust](https://rustup.rs/)
+## Maintained host boundaries
 
-Build: `cargo build`
+- `frame::PanelFrame` is the only display-ready 800 × 480 B/W/red frame type.
+  It owns the validated black and red planes and an RGB preview.
+- `raster` owns the initial send-image workflow: proportional contain scaling,
+  edge-matched letterboxing, and Floyd–Steinberg palette conversion.
+- `transport` owns serial discovery and the WireTerm/1 handshake, CRC header,
+  full-frame transfer, verification, and display completion contract.
+- `host::HostBridge` is the single serial owner exposed to the GUI and future
+  playback logic. It accepts prepared frames, never source images.
+- `app` is the visible egui/eframe editor and sender. Closing the window ends
+  the application.
 
-Run: `cargo run -- --help`
+Future extensions will render Liquid-authored, fixed 800 × 480 SVG through a
+pure-Rust rasterizer. SVG text and vector paint must map directly to the panel
+palette. Only embedded raster image assets are dithered before composition.
+The resulting exact-palette composition constructs `PanelFrame` directly, so
+it is not passed through the send-image raster dither a second time. Playlist
+and extension behavior are not implemented yet.
 
-Lint: `cargo clippy --all-targets --all-features -- -D warnings`
+## WireTerm/1
 
-Format: `cargo fmt`
+The host sends:
 
-Test: `cargo test`
+```text
+HELLO WIRETERM/1
+BEGIN 800 480 BWR 96000 <CRC32_HEX>
+<48,000 black-plane bytes><48,000 red-plane bytes>
+```
 
-Regenerate docs: `cargo run --bin gen-docs`
+The display bridge accepts a frame only after the contract and complete
+payload CRC verify. It then performs one full refresh, enters panel deep
+sleep, powers the panel off, and reports completion. Wi-Fi and Bluetooth stay
+disabled.
 
-###  Advanced
+## Firmware
 
-Benchmark: `cargo bench` (HTML report at `target/criterion/report/index.html`;
-fast sanity pass: `cargo bench --bench cli_bench -- --quick`)
+The maintained PlatformIO project is in
+[`firmware/esp32_epaper_receiver`](firmware/esp32_epaper_receiver). A normal
+`pio run` is build-only. Flashing and panel diagnostics must be initiated
+explicitly by an operator.
 
-Security audit: `cargo audit` (requires `cargo install cargo-audit`)
+## Development checks
 
-Release:
-
-1. `cargo publish patch` (or `minor` or `major`)
-2. `git push main`
-3. git push your tag
-4. Wait for CI to finish the job
-
-## Template Setup
-
-1. **Create a new repository** from this template on GitHub (click "Use this template")
-
-2. **Clone your new repository** and navigate to it
-
-3. **Update project metadata** in `Cargo.toml`:
-   - Change `name` to your project name (use kebab-case, e.g., `my-awesome-tool`)
-   - Update the `[lib]` name to match (snake_case, e.g., `my_awesome_tool`)
-   - Update the first `[[bin]]` name and `default-run` to match (kebab-case)
-   - Update `authors`, `description`, `repository`, `keywords`, and `categories`
-   - Update dependencies as required
-
-4. **Update the crate references in source**:
-   - `src/main.rs`: change `rust_template::cli::run()` to `your_crate_name::cli::run()`
-   - `src/bin/gen_docs.rs` and `benches/cli_bench.rs`: update the `use rust_template::...` imports
-   - Everything else uses `crate::` paths or `env!("CARGO_PKG_NAME")` and
-     picks up the rename automatically
-
-5. **Update `.github/workflows/ci-cd.yml`**:
-   - Change `BIN="rust-template"` in the Package binary step to your binary name
-
-6. **Update `.vscode/launch.json`** (if using VS Code):
-   - Replace `rust-template` / `rust_template` in the `cargo` sections
-
-7. **Update the README**:
-   - Replace the title and description
-   - Remove or customize this Template Setup section
-
-8. **Verify everything works**:
-   ```bash
-   cargo test
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo fmt --check
-   cargo run --bin gen-docs
-   ```
+```text
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```

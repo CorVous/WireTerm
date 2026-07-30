@@ -1,7 +1,7 @@
-//! Binary entry point.
+//! `WireTerm` foreground application entry point.
 
-use std::process::ExitCode;
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-fn main() -> ExitCode {
-    rust_template::cli::run()
+fn main() -> eframe::Result<()> {
+    wireterm::app::run()
 }

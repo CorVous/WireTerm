@@ -14,7 +14,11 @@ An 800 × 480 frame consists of a 48,000-byte black plane followed by a 48,000-b
 
 ## Host renderer
 
-The Windows application that prepares a frame for the target panel, including color conversion and dithering, before serial transfer.
+The Windows application component that turns source content into a frame. Raster images are palette-dithered, while exact-palette vector and text content is composed directly.
+
+## Host bridge
+
+The single host-side owner of display-bridge discovery and serial transfer. Frame producers submit complete frames to it and do not access serial transport directly.
 
 ## Send-image workflow
 
@@ -22,11 +26,15 @@ The first host interaction: choose one image file, prepare it as a frame, and se
 
 ## Host GUI
 
-The intended first host interface is a Windows GUI for selecting an image, previewing the prepared frame, choosing a serial device, and observing transfer progress. The GUI toolkit is a short prototype decision, beginning with egui and eframe.
+The visible foreground Windows application for selecting an image, previewing the prepared frame, choosing a serial device, and observing transfer progress. Closing the window ends the host process.
 
 ## Focused sender layout
 
 The preferred WireTerm GUI direction is a deliberately simple sender: one selected image, one large panel preview, one visible device status, and one clear send action. Advanced settings remain out of the initial screen.
+
+## Extension frame rendering
+
+The future host path that evaluates Liquid into a fixed 800 × 480 SVG and rasterizes it in pure Rust. SVG text and vector art use exact panel colors; only raster image assets are dithered before composition.
 
 ## Display bridge firmware
 
