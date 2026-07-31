@@ -110,6 +110,17 @@ BEGIN 800 480 BWR 96000 <CRC32_HEX>
 <48,000 black-plane bytes><48,000 red-plane bytes>
 ```
 
+The current receiver identifies itself with a required token-safe product field:
+
+```text
+OK WIRETERM/1 state=READY render=FULL_FRAME product=WireTerm%20USB%20Device
+```
+
+The host strictly percent-decodes and validates this bounded ASCII field before
+discovering the receiver. It presents the decoded product name together with the
+current port, for example `WireTerm USB Device · COM9`. Firmware without a valid
+product field is not a current WireTerm/1 receiver.
+
 The display bridge accepts a frame only after the contract and complete
 payload CRC verify. It then performs one full refresh, enters panel deep
 sleep, powers the panel off, and reports completion. Wi-Fi and Bluetooth stay

@@ -47,6 +47,17 @@ TEST BWR
 BEGIN 800 480 BWR 96000 <CRC32_HEX>
 ```
 
+The required discovery exchange is:
+
+```text
+HELLO WIRETERM/1
+OK WIRETERM/1 state=READY render=FULL_FRAME product=WireTerm%20USB%20Device
+```
+
+`product` is a bounded percent-encoded token. The host validates and decodes it
+before displaying `WireTerm USB Device · <port>`. A missing or invalid product
+field fails discovery.
+
 After a valid `BEGIN`, the device replies `OK BEGIN READY bytes=96000`. The host
 then sends exactly 48,000 black-plane bytes followed by 48,000 red-plane bytes.
 CRC32 uses the standard IEEE polynomial over the complete 96,000-byte payload.

@@ -40,6 +40,10 @@ The host path that runs an extension script to produce fixed 800 × 480 SVG and 
 
 The intentionally thin ESP32 firmware that receives validated frames over USB serial and drives the e-paper panel; it does not perform host-side rendering work.
 
+## Receiver product name
+
+The stable human-readable identity a display bridge supplies during WireTerm/1 discovery. The Host GUI presents it with the current serial port so the receiver remains recognizable when Windows assigns a different port.
+
 ## Reference firmware
 
 The currently installed TRMNL firmware, retained only as a reference while WireTerm replaces it with custom offline serial firmware.

@@ -254,10 +254,11 @@ impl WireTermApp {
             self.selected_port = devices.first().map(|device| device.port_name.clone());
         }
         self.devices = devices;
-        self.host_status = self.selected_port.as_ref().map_or_else(
-            || "No display bridge".to_owned(),
-            |port| format!("{port} · display bridge available"),
-        );
+        self.host_status = self
+            .selected_port
+            .as_ref()
+            .and_then(|port| self.devices.iter().find(|device| &device.port_name == port))
+            .map_or_else(|| "No display bridge".to_owned(), DeviceInfo::display_label);
     }
 
     fn poll_playback(&mut self) {
@@ -1146,7 +1147,15 @@ impl WireTermApp {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Display bridge");
-                    let selected_text = self.selected_port.as_deref().unwrap_or("No device");
+                    let selected_text = self
+                        .selected_port
+                        .as_ref()
+                        .and_then(|port| {
+                            self.devices
+                                .iter()
+                                .find(|device| &device.port_name == port)
+                        })
+                        .map_or_else(|| "No device".to_owned(), DeviceInfo::display_label);
                     egui::ComboBox::from_id_salt("wireterm-device")
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
@@ -1154,10 +1163,7 @@ impl WireTermApp {
                                 ui.selectable_value(
                                     &mut self.selected_port,
                                     Some(device.port_name.clone()),
-                                    format!(
-                                        "{} · {}",
-                                        device.port_name, device.description
-                                    ),
+                                    device.display_label(),
                                 );
                             }
                         });

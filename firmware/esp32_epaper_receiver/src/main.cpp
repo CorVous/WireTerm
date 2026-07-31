@@ -258,7 +258,9 @@ bool beginFrame(const char* command) {
 
 void reply(const char* command) {
   if (strcmp(command, "HELLO WIRETERM/1") == 0) {
-    Serial.println("OK WIRETERM/1 state=READY render=FULL_FRAME");
+    Serial.println(
+        "OK WIRETERM/1 state=READY render=FULL_FRAME "
+        "product=WireTerm%20USB%20Device");
   } else if (strcmp(command, "STATUS") == 0) {
     Serial.printf(
         "STATUS state=READY panel=epd7in5b_V2 size=800x480 "

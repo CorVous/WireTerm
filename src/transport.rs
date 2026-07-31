@@ -16,12 +16,25 @@ const BAUD_RATE: u32 = 115_200;
 const CHUNK_BYTES: usize = 1024;
 const CP210X_VID: u16 = 0x10C4;
 const CP210X_PID: u16 = 0xEA60;
+const MAX_ENCODED_PRODUCT_NAME_BYTES: usize = 96;
+const MAX_PRODUCT_NAME_BYTES: usize = 48;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceInfo {
     pub port_name: String,
-    pub description: String,
-    pub is_wireterm_candidate: bool,
+    pub product_name: String,
+}
+
+impl DeviceInfo {
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        format!("{} · {}", self.product_name, self.port_name)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HandshakeInfo {
+    product_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,42 +89,49 @@ pub enum TransportError {
     },
     #[error("device response exceeded 256 bytes")]
     ResponseTooLong,
+    #[error("device response contained invalid characters")]
+    InvalidResponseCharacters,
+    #[error("device did not provide a valid WireTerm/1 product identity")]
+    InvalidHandshake,
 }
 
 pub fn discover_devices() -> Result<Vec<DeviceInfo>, TransportError> {
     let mut devices: Vec<_> = serialport::available_ports()
         .map_err(TransportError::Discovery)?
         .into_iter()
-        .map(|port| {
-            let (description, is_wireterm_candidate) = match port.port_type {
-                serialport::SerialPortType::UsbPort(info) => {
-                    let candidate = info.vid == CP210X_VID && info.pid == CP210X_PID;
-                    let label = info
-                        .product
-                        .or(info.manufacturer)
-                        .unwrap_or_else(|| format!("USB {:04X}:{:04X}", info.vid, info.pid));
-                    (label, candidate)
-                }
-                serialport::SerialPortType::BluetoothPort => {
-                    ("Bluetooth serial port".to_owned(), false)
-                }
-                serialport::SerialPortType::PciPort => ("PCI serial port".to_owned(), false),
-                serialport::SerialPortType::Unknown => ("Serial port".to_owned(), false),
+        .filter_map(|port| {
+            let serialport::SerialPortType::UsbPort(info) = port.port_type else {
+                return None;
             };
-            DeviceInfo {
-                port_name: port.port_name,
-                description,
-                is_wireterm_candidate,
+            if info.vid != CP210X_VID || info.pid != CP210X_PID {
+                return None;
             }
+            let handshake = probe_receiver(&port.port_name).ok()?;
+            Some(DeviceInfo {
+                port_name: port.port_name,
+                product_name: handshake.product_name,
+            })
         })
         .collect();
-    devices.sort_by(|left, right| {
-        right
-            .is_wireterm_candidate
-            .cmp(&left.is_wireterm_candidate)
-            .then_with(|| left.port_name.cmp(&right.port_name))
-    });
+    devices.sort_by(|left, right| left.port_name.cmp(&right.port_name));
     Ok(devices)
+}
+
+fn probe_receiver(port_name: &str) -> Result<HandshakeInfo, TransportError> {
+    let mut port = serialport::new(port_name, BAUD_RATE)
+        .timeout(Duration::from_secs(1))
+        .open()
+        .map_err(|source| TransportError::Open {
+            port: port_name.to_owned(),
+            source,
+        })?;
+    thread::sleep(Duration::from_secs(2));
+    port.clear(serialport::ClearBuffer::Input)
+        .map_err(|source| TransportError::PortConfiguration {
+            operation: "could not clear device input",
+            source,
+        })?;
+    handshake(&mut port)
 }
 
 pub fn send_frame(
@@ -137,7 +157,7 @@ pub fn send_frame(
         })?;
 
     progress(TransferStage::Handshaking);
-    handshake(&mut port)?;
+    let _handshake = handshake(&mut port)?;
     begin_and_write(&mut port, frame, &mut progress)?;
 
     port.set_timeout(Duration::from_secs(8)).map_err(|source| {
@@ -161,23 +181,87 @@ pub fn send_frame(
     Ok(())
 }
 
-fn handshake(stream: &mut (impl Read + Write)) -> Result<(), TransportError> {
-    let mut last_response = String::new();
+fn handshake(stream: &mut (impl Read + Write)) -> Result<HandshakeInfo, TransportError> {
     for attempt in 0..3 {
         write_all(stream, b"HELLO WIRETERM/1\n", "could not write handshake")?;
         flush(stream, "could not flush handshake")?;
-        last_response = read_response(stream)?;
-        if last_response.starts_with("OK WIRETERM/1") {
-            return Ok(());
+        let response = read_response(stream)?;
+        if let Ok(handshake) = parse_handshake_response(&response) {
+            return Ok(handshake);
         }
         if attempt < 2 {
             thread::sleep(Duration::from_millis(150));
         }
     }
-    Err(TransportError::UnexpectedResponse {
-        phase: "handshake",
-        response: last_response,
-    })
+    Err(TransportError::InvalidHandshake)
+}
+
+fn parse_handshake_response(response: &str) -> Result<HandshakeInfo, TransportError> {
+    let mut tokens = response.split_ascii_whitespace();
+    if tokens.next() != Some("OK") || tokens.next() != Some("WIRETERM/1") {
+        return Err(TransportError::InvalidHandshake);
+    }
+
+    let mut encoded_product_name = None;
+    for token in tokens {
+        let Some(value) = token.strip_prefix("product=") else {
+            continue;
+        };
+        if encoded_product_name.replace(value).is_some() {
+            return Err(TransportError::InvalidHandshake);
+        }
+    }
+    let product_name = encoded_product_name
+        .and_then(decode_product_name)
+        .ok_or(TransportError::InvalidHandshake)?;
+    Ok(HandshakeInfo { product_name })
+}
+
+fn decode_product_name(encoded: &str) -> Option<String> {
+    if encoded.is_empty() || encoded.len() > MAX_ENCODED_PRODUCT_NAME_BYTES {
+        return None;
+    }
+
+    let encoded = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if byte == b'%' {
+            let high = *encoded.get(index + 1)?;
+            let low = *encoded.get(index + 2)?;
+            decoded.push(hex_value(high)? << 4 | hex_value(low)?);
+            index += 3;
+        } else {
+            if !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                return None;
+            }
+            decoded.push(byte);
+            index += 1;
+        }
+        if decoded.len() > MAX_PRODUCT_NAME_BYTES {
+            return None;
+        }
+    }
+
+    if !decoded.iter().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b'(' | b')')
+    }) || decoded.first() == Some(&b' ')
+        || decoded.last() == Some(&b' ')
+        || decoded.windows(2).any(|window| window == b"  ")
+    {
+        return None;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn begin_and_write(
@@ -236,6 +320,7 @@ fn flush(stream: &mut impl Write, operation: &'static str) -> Result<(), Transpo
 fn read_response(stream: &mut impl Read) -> Result<String, TransportError> {
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
+    let mut saw_carriage_return = false;
     loop {
         stream
             .read_exact(&mut byte)
@@ -246,16 +331,22 @@ fn read_response(stream: &mut impl Read) -> Result<String, TransportError> {
         if byte[0] == b'\n' {
             break;
         }
-        if byte[0] != b'\r' {
-            line.push(byte[0]);
+        if saw_carriage_return {
+            return Err(TransportError::InvalidResponseCharacters);
         }
+        if byte[0] == b'\r' {
+            saw_carriage_return = true;
+            continue;
+        }
+        if !(0x20..=0x7E).contains(&byte[0]) {
+            return Err(TransportError::InvalidResponseCharacters);
+        }
+        line.push(byte[0]);
         if line.len() >= 256 {
             return Err(TransportError::ResponseTooLong);
         }
     }
-    Ok(String::from_utf8_lossy(&line)
-        .trim_matches(|character: char| character.is_control() || character == '\u{FFFD}')
-        .to_owned())
+    String::from_utf8(line).map_err(|_| TransportError::InvalidResponseCharacters)
 }
 
 #[cfg(test)]
@@ -291,8 +382,7 @@ mod tests {
     fn protocol_writes_versioned_crc_frame() {
         let frame = PanelFrame::from_palette_pixels(&vec![PanelColor::White; PIXEL_COUNT])
             .expect("valid frame");
-        let responses =
-            b"OK WIRETERM/1 state=READY\nOK BEGIN READY\nOK FRAME VERIFIED\nOK FRAME DISPLAYED\n";
+        let responses = b"OK WIRETERM/1 state=READY render=FULL_FRAME product=WireTerm%20USB%20Device\nOK BEGIN READY\nOK FRAME VERIFIED\nOK FRAME DISPLAYED\n";
         let mut stream = ScriptedStream {
             responses: Cursor::new(responses.to_vec()),
             writes: Vec::new(),
@@ -334,5 +424,63 @@ mod tests {
         let error = expect_response(&mut stream, "frame verification", "OK FRAME VERIFIED")
             .expect_err("CRC failure must be rejected");
         assert!(error.to_string().contains("ERR CRC"));
+    }
+
+    #[test]
+    fn named_handshake_decodes_required_product_identity() {
+        let handshake = parse_handshake_response(
+            "OK WIRETERM/1 state=READY render=FULL_FRAME product=WireTerm%20USB%20Device",
+        )
+        .expect("named handshake");
+
+        assert_eq!(handshake.product_name, "WireTerm USB Device");
+        assert_eq!(
+            DeviceInfo {
+                port_name: "COM9".to_owned(),
+                product_name: handshake.product_name,
+            }
+            .display_label(),
+            "WireTerm USB Device · COM9"
+        );
+    }
+
+    #[test]
+    fn handshake_rejects_missing_duplicate_or_unsafe_product_identity() {
+        for response in [
+            "OK WIRETERM/1 state=READY render=FULL_FRAME",
+            "OK WIRETERM/1 product=WireTerm product=Other",
+            "OK WIRETERM/1 product=WireTerm%0AUSB%20Device",
+            "OK WIRETERM/1 product=WireTerm%1BUSB%20Device",
+            "OK WIRETERM/1 product=WireTerm%ZZUSB%20Device",
+            "OK WIRETERM/1 product=%20WireTerm",
+        ] {
+            assert_eq!(
+                parse_handshake_response(response)
+                    .expect_err(response)
+                    .to_string(),
+                "device did not provide a valid WireTerm/1 product identity"
+            );
+        }
+    }
+
+    #[test]
+    fn response_reader_rejects_control_character_injection() {
+        for response in [
+            b"OK WIRETERM/1 product=WireTerm\x1b[2J\n".as_slice(),
+            b"OK WIRETERM/1 product=WireTerm\rInjected\n".as_slice(),
+        ] {
+            assert!(matches!(
+                read_response(&mut Cursor::new(response)),
+                Err(TransportError::InvalidResponseCharacters)
+            ));
+        }
+
+        assert_eq!(
+            read_response(&mut Cursor::new(
+                b"OK WIRETERM/1 product=WireTerm%20USB%20Device\r\n"
+            ))
+            .expect("normal CRLF response"),
+            "OK WIRETERM/1 product=WireTerm%20USB%20Device"
+        );
     }
 }
