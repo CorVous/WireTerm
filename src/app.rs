@@ -20,8 +20,9 @@ use serde_json::Value;
 
 use crate::{
     extension::{
-        EXTENSION_SCRIPT_NAME, ExtensionInput, ExtensionMetadata, HostClock, InputKind,
-        LoadedExtension, LocalFixtureHost, render_svg_to_panel,
+        EXTENSION_SCRIPT_NAME, ExtensionInput, ExtensionMetadata, InputKind, LiveExtensionHost,
+        LoadedExtension, RenderCancellation, discover_extensions, render_svg_to_panel,
+        scaffold_extension, system_fixture_clock, validate_extension_configuration,
     },
     frame::{FRAME_HEIGHT, FRAME_WIDTH, PanelFrame},
     host::{HostBridge, HostEvent},
@@ -31,8 +32,10 @@ use crate::{
         PlaylistRevision, PlaylistSource, PlaylistStore,
     },
     raster::prepare_raster_path,
+    secrets::SecretStore,
     transport::{DeviceInfo, TransferStage},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 const ACCENT: Color32 = Color32::from_rgb(232, 92, 70);
 const MUTED: Color32 = Color32::from_rgb(145, 151, 164);
@@ -74,6 +77,7 @@ struct RenderResult {
 struct RenderTask {
     receiver: Receiver<RenderResult>,
     started: Instant,
+    cancellation: RenderCancellation,
 }
 
 struct PendingTransfer {
@@ -91,6 +95,12 @@ struct WireTermApp {
     devices: Vec<DeviceInfo>,
     selected_port: Option<String>,
     store: PlaylistStore,
+    secret_store: SecretStore,
+    secret_names: Vec<String>,
+    secret_name_edit: String,
+    secret_value_edit: Zeroizing<String>,
+    extension_library_open: bool,
+    discovered_extensions: Vec<PathBuf>,
     playlist: PlaylistRevision,
     selected_item: Option<ItemId>,
     dragged_item: Option<ItemId>,
@@ -121,6 +131,9 @@ impl WireTermApp {
                 }),
             ),
         };
+        let secret_store = SecretStore::new(store.data_dir());
+        let secret_names = secret_store.names().unwrap_or_default();
+        let discovered_extensions = discover_extensions(store.data_dir()).unwrap_or_default();
         let visual_qa = std::env::var_os("WIRETERM_VISUAL_QA").is_some();
         if visual_qa {
             playlist = visual_qa_playlist();
@@ -136,6 +149,12 @@ impl WireTermApp {
             devices: Vec::new(),
             selected_port: None,
             store,
+            secret_store,
+            secret_names,
+            secret_name_edit: String::new(),
+            secret_value_edit: Zeroizing::new(String::new()),
+            extension_library_open: false,
+            discovered_extensions,
             playlist,
             selected_item,
             dragged_item: None,
@@ -298,15 +317,18 @@ impl WireTermApp {
         }
         let item_id = item.id;
         let label = source_label(&path);
+        let secrets = self.secret_store.clone();
+        let cancellation = RenderCancellation::default();
         let (sender, receiver) = mpsc::channel();
         self.render_task = Some(RenderTask {
             receiver,
             started: Instant::now(),
+            cancellation: cancellation.clone(),
         });
         thread::Builder::new()
             .name("wireterm-item-render".to_owned())
             .spawn(move || {
-                let rendered = render_item(&item, &path);
+                let rendered = render_item(&item, &path, &secrets, cancellation);
                 let _ = sender.send(RenderResult {
                     purpose,
                     item_id,
@@ -401,9 +423,18 @@ impl WireTermApp {
     }
 
     fn add_extension(&mut self) {
+        self.discovered_extensions = discover_extensions(self.store.data_dir()).unwrap_or_default();
+        self.extension_library_open = true;
+    }
+
+    fn browse_for_extension(&mut self) {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
+        self.add_extension_path(path);
+    }
+
+    fn add_extension_path(&mut self, path: PathBuf) {
         let title = source_label(&path);
         let id = self.playlist.add_item(
             title,
@@ -415,6 +446,7 @@ impl WireTermApp {
         );
         self.selected_item = Some(id);
         self.save_playlist();
+        self.extension_library_open = false;
     }
 
     fn remove_selected(&mut self) {
@@ -792,6 +824,75 @@ impl WireTermApp {
         }
     }
 
+    fn extension_library_window(&mut self, ctx: &egui::Context) {
+        if !self.extension_library_open {
+            return;
+        }
+        let mut open = true;
+        let mut add_path = None;
+        let mut browse = false;
+        let mut refresh = false;
+        let mut scaffold = false;
+        egui::Window::new("Extension library")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        self.store
+                            .data_dir()
+                            .join("extensions")
+                            .display()
+                            .to_string(),
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add_space(6.0);
+                if self.discovered_extensions.is_empty() {
+                    ui.label("No Extension folders found in adjacent data.");
+                }
+                for path in &self.discovered_extensions {
+                    ui.horizontal(|ui| {
+                        ui.label(source_label(path));
+                        if ui.small_button("Add").clicked() {
+                            add_path = Some(path.clone());
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    refresh = ui.small_button("Refresh").clicked();
+                    scaffold = ui.small_button("Scaffold Extension").clicked();
+                    browse = ui.small_button("Browse…").clicked();
+                });
+            });
+        self.extension_library_open = open;
+        if refresh {
+            self.discovered_extensions =
+                discover_extensions(self.store.data_dir()).unwrap_or_default();
+        }
+        if scaffold {
+            match scaffold_extension(self.store.data_dir()) {
+                Ok(path) => {
+                    self.discovered_extensions =
+                        discover_extensions(self.store.data_dir()).unwrap_or_default();
+                    add_path = Some(path);
+                }
+                Err(error) => {
+                    self.record_issue("Extension could not be scaffolded", error.to_string());
+                }
+            }
+        }
+        if browse {
+            self.browse_for_extension();
+        } else if let Some(path) = add_path {
+            self.add_extension_path(path);
+        }
+    }
+
     fn extension_settings(&mut self, ui: &mut egui::Ui, id: ItemId) {
         let Some((metadata, inputs)) = self.extension_schemas.get(&id).cloned() else {
             if matches!(
@@ -809,17 +910,22 @@ impl WireTermApp {
         ui.label(RichText::new(metadata.name).strong());
         let mut changes = Vec::new();
         for input in inputs {
+            let configured_value = self
+                .extension_settings_map(id)
+                .and_then(|settings| settings.get(&input.key))
+                .cloned()
+                .unwrap_or_else(|| input.default.clone());
             ui.horizontal_wrapped(|ui| {
                 ui.label(&input.label);
                 match input.kind {
                     InputKind::Text => {
-                        let mut value = self.extension_setting_string(id, &input.key);
+                        let mut value = configured_value.as_str().unwrap_or_default().to_owned();
                         if ui.text_edit_singleline(&mut value).changed() {
                             changes.push((input.key.clone(), Value::String(value), false));
                         }
                     }
                     InputKind::Number => {
-                        let mut value = self.extension_setting_number(id, &input.key);
+                        let mut value = configured_value.as_f64().unwrap_or_default();
                         if ui.add(egui::DragValue::new(&mut value)).changed()
                             && let Some(number) = serde_json::Number::from_f64(value)
                         {
@@ -827,13 +933,13 @@ impl WireTermApp {
                         }
                     }
                     InputKind::Checkbox => {
-                        let mut value = self.extension_setting_bool(id, &input.key);
+                        let mut value = configured_value.as_bool().unwrap_or_default();
                         if ui.checkbox(&mut value, "").changed() {
                             changes.push((input.key.clone(), Value::Bool(value), false));
                         }
                     }
                     InputKind::Choice => {
-                        let mut value = self.extension_setting_string(id, &input.key);
+                        let mut value = configured_value.as_str().unwrap_or_default().to_owned();
                         egui::ComboBox::from_id_salt(("extension-choice", id.get(), &input.key))
                             .selected_text(if value.is_empty() {
                                 "Choose…"
@@ -851,16 +957,22 @@ impl WireTermApp {
                     }
                     InputKind::NamedSecret => {
                         let mut value = self.extension_secret_ref(id, &input.key);
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut value)
-                                    .hint_text("Named secret reference"),
-                            )
-                            .changed()
-                        {
+                        egui::ComboBox::from_id_salt(("extension-secret", id.get(), &input.key))
+                            .selected_text(if value.is_empty() {
+                                "Not bound"
+                            } else {
+                                &value
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut value, String::new(), "Not bound");
+                                for name in &self.secret_names {
+                                    ui.selectable_value(&mut value, name.clone(), name);
+                                }
+                            });
+                        if value != self.extension_secret_ref(id, &input.key) {
                             changes.push((input.key.clone(), Value::String(value), true));
                         }
-                        ui.label(RichText::new("reference only").small().color(MUTED));
+                        ui.label(RichText::new("name only").small().color(MUTED));
                     }
                 }
             });
@@ -876,20 +988,6 @@ impl WireTermApp {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned()
-    }
-
-    fn extension_setting_number(&self, id: ItemId, key: &str) -> f64 {
-        self.extension_settings_map(id)
-            .and_then(|settings| settings.get(key))
-            .and_then(Value::as_f64)
-            .unwrap_or_default()
-    }
-
-    fn extension_setting_bool(&self, id: ItemId, key: &str) -> bool {
-        self.extension_settings_map(id)
-            .and_then(|settings| settings.get(key))
-            .and_then(Value::as_bool)
-            .unwrap_or_default()
     }
 
     fn extension_settings_map(&self, id: ItemId) -> Option<&BTreeMap<String, Value>> {
@@ -922,7 +1020,11 @@ impl WireTermApp {
         };
         if is_secret {
             if let Some(value) = value.as_str() {
-                named_secret_refs.insert(key, value.to_owned());
+                if value.is_empty() {
+                    named_secret_refs.remove(&key);
+                } else {
+                    named_secret_refs.insert(key, value.to_owned());
+                }
             }
         } else {
             settings.insert(key, value);
@@ -1063,6 +1165,8 @@ impl WireTermApp {
                         let _ = self.host.refresh_devices();
                     }
                 });
+                ui.separator();
+                self.named_secrets_editor(ui);
                 if self.selected_item.is_some_and(|id| {
                     matches!(
                         self.playlist.item(id).map(|item| &item.source),
@@ -1099,6 +1203,61 @@ impl WireTermApp {
                 }
             });
     }
+
+    fn named_secrets_editor(&mut self, ui: &mut egui::Ui) {
+        ui.label("Named secrets");
+        ui.label(
+            RichText::new(
+                "MVP values are stored locally without encryption and never stored in Playlist revisions.",
+            )
+            .small()
+            .color(MUTED),
+        );
+        let mut remove = None;
+        for name in &self.secret_names {
+            ui.horizontal(|ui| {
+                ui.label(name);
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(name.clone());
+                }
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.secret_name_edit)
+                    .desired_width(150.0)
+                    .hint_text("opaque-name"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut *self.secret_value_edit)
+                    .desired_width(210.0)
+                    .password(true)
+                    .hint_text("secret value"),
+            );
+            if ui.small_button("Create / update").clicked() {
+                match self
+                    .secret_store
+                    .set(self.secret_name_edit.trim(), &self.secret_value_edit)
+                {
+                    Ok(()) => {
+                        self.secret_names = self.secret_store.names().unwrap_or_default();
+                        self.secret_value_edit.zeroize();
+                    }
+                    Err(error) => {
+                        self.record_issue("Named secret could not be saved", error.to_string());
+                    }
+                }
+            }
+        });
+        if let Some(name) = remove {
+            match self.secret_store.remove(&name) {
+                Ok(_) => self.secret_names = self.secret_store.names().unwrap_or_default(),
+                Err(error) => {
+                    self.record_issue("Named secret could not be removed", error.to_string());
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for WireTermApp {
@@ -1132,6 +1291,15 @@ impl eframe::App for WireTermApp {
                     ui.add_space(16.0);
                 });
         });
+        self.extension_library_window(ui.ctx());
+    }
+}
+
+impl Drop for WireTermApp {
+    fn drop(&mut self) {
+        if let Some(task) = &self.render_task {
+            task.cancellation.cancel();
+        }
     }
 }
 
@@ -1140,7 +1308,12 @@ struct RenderedItem {
     frame: Result<PanelFrame, String>,
 }
 
-fn render_item(item: &PlaylistItem, path: &Path) -> RenderedItem {
+fn render_item(
+    item: &PlaylistItem,
+    path: &Path,
+    secrets: &SecretStore,
+    cancellation: RenderCancellation,
+) -> RenderedItem {
     match &item.source {
         PlaylistSource::Image { .. } | PlaylistSource::ImageFolder { .. } => RenderedItem {
             schema: None,
@@ -1157,25 +1330,28 @@ fn render_item(item: &PlaylistItem, path: &Path) -> RenderedItem {
                     frame: Err("Extension script has no parent folder".to_owned()),
                 };
             };
-            let host = Arc::new(LocalFixtureHost::new(
+            let started = Instant::now();
+            let host = Arc::new(LiveExtensionHost::new(
                 root.to_path_buf(),
                 named_secret_refs.clone(),
-                HostClock {
-                    unix_seconds: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |duration| {
-                            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-                        }),
-                    utc_offset_minutes: 0,
-                },
+                secrets.clone(),
+                system_fixture_clock(),
+                started,
+                cancellation,
             ));
             match LoadedExtension::load(path, host) {
                 Ok(extension) => {
                     let schema = Some((extension.metadata.clone(), extension.inputs.clone()));
-                    let frame = extension
-                        .render_svg(settings)
-                        .and_then(|svg| render_svg_to_panel(&svg, root))
-                        .map_err(|error| error.to_string());
+                    let available_names = secrets.names().unwrap_or_default();
+                    let frame = validate_extension_configuration(
+                        &extension.inputs,
+                        settings,
+                        named_secret_refs,
+                        &available_names,
+                    )
+                    .and_then(|resolved| extension.render_svg(&resolved))
+                    .and_then(|svg| render_svg_to_panel(&svg, root))
+                    .map_err(|error| error.to_string());
                     RenderedItem { schema, frame }
                 }
                 Err(error) => RenderedItem {

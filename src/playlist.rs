@@ -277,6 +277,7 @@ pub enum PlaylistError {
 
 #[derive(Clone, Debug)]
 pub struct PlaylistStore {
+    data_dir: PathBuf,
     revisions_dir: PathBuf,
 }
 
@@ -290,8 +291,14 @@ impl PlaylistStore {
     #[must_use]
     pub fn new(data_dir: &Path) -> Self {
         Self {
+            data_dir: data_dir.to_path_buf(),
             revisions_dir: data_dir.join("playlist-revisions"),
         }
+    }
+
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     #[must_use]

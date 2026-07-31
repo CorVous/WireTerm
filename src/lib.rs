@@ -12,4 +12,5 @@ pub mod host;
 pub mod playback;
 pub mod playlist;
 pub mod raster;
+pub mod secrets;
 pub mod transport;

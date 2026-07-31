@@ -6,10 +6,13 @@
 
 use std::{
     collections::BTreeMap,
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     str,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +28,7 @@ use crate::{
     frame::{FrameError, PIXEL_COUNT, PanelColor, PanelFrame},
     playlist::is_safe_relative_asset_path,
     raster::dither_raster_asset,
+    secrets::SecretStore,
 };
 
 pub const EXTENSION_SCRIPT_NAME: &str = "extension.lua";
@@ -34,6 +38,9 @@ pub const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_SVG_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_LUA_TIME: Duration = Duration::from_secs(30);
 pub const MAX_LUA_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const BUNDLED_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Inter.ttf");
+pub const BUNDLED_FONT_FAMILY: &str = "Inter";
+const EXAMPLE_EXTENSION_LUA: &str = include_str!("../examples/http-extension/extension.lua");
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExtensionMetadata {
@@ -77,12 +84,13 @@ pub struct HostHttpRequest {
     pub secret_headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
     pub timeout: Duration,
+    pub max_redirects: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostHttpResponse {
     pub status: u16,
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, Vec<u8>>,
     pub body: Vec<u8>,
 }
 
@@ -94,8 +102,16 @@ pub struct HostClock {
 
 #[derive(Debug, Error)]
 pub enum HostApiError {
+    #[error("HTTP request is invalid")]
+    InvalidHttp,
     #[error("HTTP request failed")]
     Http,
+    #[error("HTTP request timed out")]
+    Timeout,
+    #[error("Extension render was cancelled")]
+    Cancelled,
+    #[error("Extension render time limit exceeded")]
+    TimeLimit,
     #[error("HTTP response exceeded the 5 MiB limit")]
     ResponseTooLarge,
     #[error("named secret reference is not bound")]
@@ -104,6 +120,21 @@ pub enum HostApiError {
     UnsafeAssetPath,
     #[error("local asset is unavailable")]
     MissingAsset,
+}
+
+/// Cooperative cancellation shared by the foreground app and render worker.
+#[derive(Clone, Debug, Default)]
+pub struct RenderCancellation(Arc<AtomicBool>);
+
+impl RenderCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Narrow capability surface supplied to a Lua Extension.
@@ -115,6 +146,178 @@ pub trait ExtensionHostApi: Send + Sync {
     fn http(&self, request: HostHttpRequest) -> Result<HostHttpResponse, HostApiError>;
     fn clock(&self) -> HostClock;
     fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError>;
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Production host for one Extension render.
+///
+/// HTTP is deliberately synchronous because the whole Lua render already runs
+/// on an app-owned worker thread. Every request is bounded by both its declared
+/// timeout and the render's remaining overall budget.
+pub struct LiveExtensionHost {
+    extension_root: PathBuf,
+    named_secret_refs: BTreeMap<String, String>,
+    secrets: SecretStore,
+    clock: HostClock,
+    started: Instant,
+    cancellation: RenderCancellation,
+}
+
+impl LiveExtensionHost {
+    #[must_use]
+    pub const fn new(
+        extension_root: PathBuf,
+        named_secret_refs: BTreeMap<String, String>,
+        secrets: SecretStore,
+        clock: HostClock,
+        started: Instant,
+        cancellation: RenderCancellation,
+    ) -> Self {
+        Self {
+            extension_root,
+            named_secret_refs,
+            secrets,
+            clock,
+            started,
+            cancellation,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, HostApiError> {
+        if self.cancellation.is_cancelled() {
+            return Err(HostApiError::Cancelled);
+        }
+        MAX_LUA_TIME
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(HostApiError::TimeLimit)
+    }
+
+    fn resolve_secret_headers(
+        &self,
+        references: BTreeMap<String, String>,
+    ) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, HostApiError>
+    {
+        references
+            .into_iter()
+            .map(|(header_name, input_key)| {
+                let secret_name = self
+                    .named_secret_refs
+                    .get(&input_key)
+                    .ok_or(HostApiError::SecretNotBound)?;
+                let value = self
+                    .secrets
+                    .resolve(secret_name)
+                    .map_err(|_| HostApiError::SecretNotBound)?;
+                let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+                    .map_err(|_| HostApiError::InvalidHttp)?;
+                let mut header = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|_| HostApiError::InvalidHttp)?;
+                header.set_sensitive(true);
+                Ok((name, header))
+            })
+            .collect()
+    }
+}
+
+impl ExtensionHostApi for LiveExtensionHost {
+    fn http(&self, request: HostHttpRequest) -> Result<HostHttpResponse, HostApiError> {
+        let timeout = request.timeout.min(MAX_HTTP_TIMEOUT).min(self.remaining()?);
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| HostApiError::InvalidHttp)?;
+        let url = reqwest::Url::parse(&request.url).map_err(|_| HostApiError::InvalidHttp)?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(HostApiError::InvalidHttp);
+        }
+        let has_secret_headers = !request.secret_headers.is_empty();
+        let redirect = if request.max_redirects == 0 {
+            reqwest::redirect::Policy::none()
+        } else {
+            let maximum = usize::from(request.max_redirects.min(10));
+            reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= maximum {
+                    attempt.error("redirect limit exceeded")
+                } else if has_secret_headers
+                    && attempt.previous().last().is_some_and(|previous| {
+                        attempt.url().scheme() != previous.scheme()
+                            || attempt.url().host_str() != previous.host_str()
+                            || attempt.url().port_or_known_default()
+                                != previous.port_or_known_default()
+                    })
+                {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            })
+        };
+        let client = reqwest::blocking::Client::builder()
+            .redirect(redirect)
+            .referer(false)
+            .timeout(timeout)
+            .user_agent(concat!("WireTerm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| HostApiError::Http)?;
+        let mut builder = client.request(method, url).body(request.body);
+        for (name, value) in request.headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| HostApiError::InvalidHttp)?;
+            let value = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| HostApiError::InvalidHttp)?;
+            builder = builder.header(name, value);
+        }
+        for (name, value) in self.resolve_secret_headers(request.secret_headers)? {
+            builder = builder.header(name, value);
+        }
+        let mut response = builder.send().map_err(|error| {
+            if error.is_timeout() {
+                HostApiError::Timeout
+            } else {
+                HostApiError::Http
+            }
+        })?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(HostApiError::ResponseTooLarge);
+        }
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        let mut body = Vec::new();
+        response
+            .by_ref()
+            .take((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|_| HostApiError::Http)?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(HostApiError::ResponseTooLarge);
+        }
+        self.remaining()?;
+        Ok(HostHttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    fn clock(&self) -> HostClock {
+        self.clock.clone()
+    }
+
+    fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError> {
+        contained_asset(&self.extension_root, relative_path)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -202,15 +405,25 @@ impl ExtensionHostApi for LocalFixtureHost {
     }
 
     fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError> {
-        if !is_safe_relative_asset_path(relative_path) {
-            return Err(HostApiError::UnsafeAssetPath);
-        }
-        let path = self.extension_root.join(relative_path);
-        if path.is_file() {
-            Ok(path)
-        } else {
-            Err(HostApiError::MissingAsset)
-        }
+        contained_asset(&self.extension_root, relative_path)
+    }
+}
+
+fn contained_asset(root: &Path, relative_path: &Path) -> Result<PathBuf, HostApiError> {
+    if !is_safe_relative_asset_path(relative_path) {
+        return Err(HostApiError::UnsafeAssetPath);
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|_| HostApiError::MissingAsset)?;
+    let path = root
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|_| HostApiError::MissingAsset)?;
+    if path.is_file() && path.starts_with(root) {
+        Ok(path)
+    } else {
+        Err(HostApiError::UnsafeAssetPath)
     }
 }
 
@@ -222,6 +435,12 @@ pub enum ExtensionError {
     Lua(String),
     #[error("Extension metadata is invalid: {0}")]
     Metadata(String),
+    #[error("Extension settings are invalid: {0}")]
+    Configuration(String),
+    #[error("Extension library could not be read")]
+    LibraryRead,
+    #[error("Extension could not be scaffolded")]
+    Scaffold,
     #[error("Extension renderer did not return UTF-8 SVG")]
     SvgNotUtf8,
     #[error("Extension renderer returned more than 2 MiB of SVG")]
@@ -254,12 +473,21 @@ impl LoadedExtension {
         host: Arc<dyn ExtensionHostApi>,
     ) -> Result<Self, ExtensionError> {
         let script = std::fs::read(script_path).map_err(|_| ExtensionError::ReadScript)?;
-        let lua = Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default())
+        let libraries =
+            StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH;
+        let lua = Lua::new_with(libraries, LuaOptions::default())
             .map_err(|error| ExtensionError::Lua(safe_lua_error(&error)))?;
+        for name in [
+            "io", "os", "package", "debug", "dofile", "loadfile", "require",
+        ] {
+            lua.globals()
+                .set(name, LuaValue::Nil)
+                .map_err(|error| ExtensionError::Lua(safe_lua_error(&error)))?;
+        }
         lua.set_memory_limit(MAX_LUA_MEMORY_BYTES)
             .map_err(|error| ExtensionError::Lua(safe_lua_error(&error)))?;
         let started = Instant::now();
-        install_render_limit(&lua, started)?;
+        install_render_limit(&lua, started, Arc::clone(&host))?;
         install_host_api(&lua, host)?;
         let module = lua
             .load(&script)
@@ -353,15 +581,158 @@ fn validate_inputs(inputs: &[ExtensionInput]) -> Result<(), ExtensionError> {
                 "input keys and labels must be non-empty and unique".to_owned(),
             ));
         }
+        if !input.default.is_null() && !value_matches_kind(&input.default, input.kind) {
+            return Err(ExtensionError::Metadata(
+                "input defaults must match their declared kinds".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
 
-fn install_render_limit(lua: &Lua, started: Instant) -> Result<(), ExtensionError> {
+fn value_matches_kind(value: &Value, kind: InputKind) -> bool {
+    match kind {
+        InputKind::Text | InputKind::Choice => value.is_string(),
+        InputKind::Number => value.is_number(),
+        InputKind::Checkbox => value.is_boolean(),
+        InputKind::NamedSecret => false,
+    }
+}
+
+/// Resolve defaults and validate settings plus opaque named-secret bindings.
+pub fn validate_extension_configuration(
+    inputs: &[ExtensionInput],
+    settings: &BTreeMap<String, Value>,
+    named_secret_refs: &BTreeMap<String, String>,
+    available_secret_names: &[String],
+) -> Result<BTreeMap<String, Value>, ExtensionError> {
+    let declared = inputs
+        .iter()
+        .map(|input| input.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let secret_inputs = inputs
+        .iter()
+        .filter(|input| input.kind == InputKind::NamedSecret)
+        .map(|input| input.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if settings
+        .keys()
+        .any(|key| !declared.contains(key.as_str()) || secret_inputs.contains(key.as_str()))
+        || named_secret_refs
+            .keys()
+            .any(|key| !secret_inputs.contains(key.as_str()))
+    {
+        return Err(ExtensionError::Configuration(
+            "a saved setting or secret binding is not declared in the correct input class"
+                .to_owned(),
+        ));
+    }
+    let available = available_secret_names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut resolved = BTreeMap::new();
+    for input in inputs {
+        if input.kind == InputKind::NamedSecret {
+            match named_secret_refs.get(&input.key) {
+                Some(name) if available.contains(name.as_str()) => {}
+                Some(_) => {
+                    return Err(ExtensionError::Configuration(
+                        "a named-secret binding is unavailable".to_owned(),
+                    ));
+                }
+                None if input.required => {
+                    return Err(ExtensionError::Configuration(
+                        "a required named-secret input is not bound".to_owned(),
+                    ));
+                }
+                None => {}
+            }
+            continue;
+        }
+        let value = settings
+            .get(&input.key)
+            .filter(|value| !value.is_null())
+            .cloned()
+            .or_else(|| (!input.default.is_null()).then(|| input.default.clone()));
+        let Some(value) = value else {
+            if input.required {
+                return Err(ExtensionError::Configuration(
+                    "a required input has no value".to_owned(),
+                ));
+            }
+            continue;
+        };
+        if (input.required
+            && matches!(input.kind, InputKind::Text | InputKind::Choice)
+            && value.as_str().is_some_and(str::is_empty))
+            || !value_matches_kind(&value, input.kind)
+            || (input.kind == InputKind::Choice
+                && value
+                    .as_str()
+                    .is_none_or(|choice| !input.choices.iter().any(|item| item == choice)))
+        {
+            return Err(ExtensionError::Configuration(
+                "an input value does not match its declared schema".to_owned(),
+            ));
+        }
+        resolved.insert(input.key.clone(), value);
+    }
+    Ok(resolved)
+}
+
+/// Discover direct child folders containing exactly one conventional script.
+pub fn discover_extensions(data_dir: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
+    let library = data_dir.join("extensions");
+    let entries = match std::fs::read_dir(library) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ExtensionError::LibraryRead),
+    };
+    let mut roots = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(EXTENSION_SCRIPT_NAME).is_file())
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+    Ok(roots)
+}
+
+/// Create an editable HTTP example under the adjacent Extension library.
+pub fn scaffold_extension(data_dir: &Path) -> Result<PathBuf, ExtensionError> {
+    let library = data_dir.join("extensions");
+    std::fs::create_dir_all(&library).map_err(|_| ExtensionError::Scaffold)?;
+    let root = (1_u16..=999)
+        .map(|suffix| {
+            if suffix == 1 {
+                library.join("http-extension")
+            } else {
+                library.join(format!("http-extension-{suffix}"))
+            }
+        })
+        .find(|candidate| !candidate.exists())
+        .ok_or(ExtensionError::Scaffold)?;
+    std::fs::create_dir(&root).map_err(|_| ExtensionError::Scaffold)?;
+    let temporary = root.join("extension.lua.tmp");
+    std::fs::write(&temporary, EXAMPLE_EXTENSION_LUA).map_err(|_| ExtensionError::Scaffold)?;
+    std::fs::rename(temporary, root.join(EXTENSION_SCRIPT_NAME))
+        .map_err(|_| ExtensionError::Scaffold)?;
+    Ok(root)
+}
+
+fn install_render_limit(
+    lua: &Lua,
+    started: Instant,
+    host: Arc<dyn ExtensionHostApi>,
+) -> Result<(), ExtensionError> {
     lua.set_hook(
         HookTriggers::new().every_nth_instruction(10_000),
         move |_, _| {
-            if started.elapsed() > MAX_LUA_TIME {
+            if host.is_cancelled() {
+                Err(mlua::Error::RuntimeError(
+                    "Extension render was cancelled".to_owned(),
+                ))
+            } else if started.elapsed() > MAX_LUA_TIME {
                 Err(mlua::Error::RuntimeError(
                     "render time limit exceeded".to_owned(),
                 ))
@@ -430,8 +801,15 @@ fn parse_http_request(table: &Table) -> mlua::Result<HostHttpRequest> {
     let body = table
         .get::<Option<mlua::String>>("body")?
         .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
-    let timeout_ms = table.get::<Option<u64>>("timeout_ms")?.unwrap_or(15_000);
+    let timeout_ms = table
+        .get::<Option<u64>>("timeout_ms")?
+        .unwrap_or(15_000)
+        .clamp(1, 60_000);
     let timeout = Duration::from_millis(timeout_ms).min(MAX_HTTP_TIMEOUT);
+    let max_redirects = table
+        .get::<Option<u8>>("max_redirects")?
+        .unwrap_or_default()
+        .min(10);
     Ok(HostHttpRequest {
         method,
         url,
@@ -439,6 +817,7 @@ fn parse_http_request(table: &Table) -> mlua::Result<HostHttpRequest> {
         secret_headers,
         body,
         timeout,
+        max_redirects,
     })
 }
 
@@ -459,7 +838,7 @@ fn response_to_lua(lua: &Lua, response: HostHttpResponse) -> mlua::Result<Table>
     result.set("status", response.status)?;
     let headers = lua.create_table()?;
     for (name, value) in response.headers {
-        headers.set(name, value)?;
+        headers.set(name, lua.create_string(value)?)?;
     }
     result.set("headers", headers)?;
     result.set("body", lua.create_string(response.body)?)?;
@@ -514,7 +893,7 @@ pub fn render_svg_to_panel(svg: &str, extension_root: &Path) -> Result<PanelFram
         image_href_resolver,
         ..Default::default()
     };
-    load_windows_ui_font(&mut options);
+    load_bundled_font(&mut options);
     let tree = resvg::usvg::Tree::from_str(svg, &options)
         .map_err(|error| ExtensionError::Svg(error.to_string()))?;
     let size = tree.size().to_int_size();
@@ -538,13 +917,15 @@ pub fn render_svg_to_panel(svg: &str, extension_root: &Path) -> Result<PanelFram
     PanelFrame::from_palette_pixels(&pixels).map_err(Into::into)
 }
 
-fn load_windows_ui_font(options: &mut resvg::usvg::Options<'_>) {
-    let windows_directory =
-        std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    if let Ok(bytes) = std::fs::read(windows_directory.join("Fonts").join("segoeui.ttf")) {
-        options.fontdb_mut().load_font_data(bytes);
-        "Segoe UI".clone_into(&mut options.font_family);
-    }
+fn load_bundled_font(options: &mut resvg::usvg::Options<'_>) {
+    let database = options.fontdb_mut();
+    database.load_font_data(BUNDLED_FONT_BYTES.to_vec());
+    database.set_serif_family(BUNDLED_FONT_FAMILY);
+    database.set_sans_serif_family(BUNDLED_FONT_FAMILY);
+    database.set_cursive_family(BUNDLED_FONT_FAMILY);
+    database.set_fantasy_family(BUNDLED_FONT_FAMILY);
+    database.set_monospace_family(BUNDLED_FONT_FAMILY);
+    BUNDLED_FONT_FAMILY.clone_into(&mut options.font_family);
 }
 
 fn validate_svg_canvas(svg: &str) -> Result<(), ExtensionError> {
@@ -628,7 +1009,9 @@ fn prepare_svg_assets(
                 "each raster asset reference may appear only once".to_owned(),
             ));
         }
-        let source = image::open(extension_root.join(relative))
+        let asset_path =
+            contained_asset(extension_root, relative).map_err(|_| ExtensionError::UnsafeAsset)?;
+        let source = image::open(asset_path)
             .map_err(|_| ExtensionError::AssetDecode)?
             .to_rgb8();
         let placed = image::imageops::resize(
@@ -690,6 +1073,10 @@ pub fn system_fixture_clock() -> HostClock {
 mod tests {
     use std::{
         fs,
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
         time::{Duration, SystemTime},
     };
 
@@ -716,6 +1103,77 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn live_host(
+        root: &Path,
+        refs: BTreeMap<String, String>,
+        cancellation: RenderCancellation,
+    ) -> LiveExtensionHost {
+        LiveExtensionHost::new(
+            root.to_path_buf(),
+            refs,
+            SecretStore::new(root),
+            HostClock {
+                unix_seconds: 1_700_000_000,
+                utc_offset_minutes: 0,
+            },
+            Instant::now(),
+            cancellation,
+        )
+    }
+
+    fn request(url: String) -> HostHttpRequest {
+        HostHttpRequest {
+            method: "GET".to_owned(),
+            url,
+            headers: BTreeMap::new(),
+            secret_headers: BTreeMap::new(),
+            body: Vec::new(),
+            timeout: Duration::from_secs(2),
+            max_redirects: 0,
+        }
+    }
+
+    fn serve_responses(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, mpsc::Receiver<Vec<Vec<u8>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let (requests_receiver, handle) = serve_on(listener, responses);
+        (format!("http://{address}"), requests_receiver, handle)
+    }
+
+    fn serve_on(
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+    ) -> (mpsc::Receiver<Vec<Vec<u8>>>, thread::JoinHandle<()>) {
+        let (requests_sender, requests_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept fixture request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut chunk).unwrap_or_default();
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(bytes);
+                stream.write_all(&response).expect("fixture response");
+            }
+            let _ = requests_sender.send(requests);
+        });
+        (requests_receiver, handle)
     }
 
     #[test]
@@ -774,7 +1232,7 @@ mod tests {
                     status: 200,
                     headers: BTreeMap::from([(
                         "Content-Type".to_owned(),
-                        "application/octet-stream".to_owned(),
+                        b"application/octet-stream".to_vec(),
                     )]),
                     body: vec![0, 159, 146, 150, 255],
                 },
@@ -834,5 +1292,241 @@ mod tests {
             &frame.preview_rgb()[black..black + 3],
             &PanelColor::Black.rgb()
         );
+    }
+
+    #[test]
+    fn live_http_preserves_response_bytes_and_enforces_redirect_policy() {
+        let fixture = TestExtension::new();
+        let final_body = vec![0, 159, 146, 150, 255];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let location = format!("http://{address}/final");
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let final_response = [
+            b"HTTP/1.1 207 Multi-Status\r\nX-WireTerm: bytes\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+                .as_slice(),
+            final_body.as_slice(),
+        ]
+        .concat();
+        let (requests, server) =
+            serve_on(listener, vec![redirect.clone(), redirect, final_response]);
+        let base = format!("http://{address}");
+        let host = live_host(&fixture.0, BTreeMap::new(), RenderCancellation::default());
+
+        let denied = host
+            .http(request(format!("{base}/redirect")))
+            .expect("302 response");
+        assert_eq!(denied.status, 302);
+        let mut followed_request = request(format!("{base}/redirect"));
+        followed_request.max_redirects = 2;
+        let followed = host.http(followed_request).expect("followed response");
+        assert_eq!(followed.status, 207);
+        assert_eq!(followed.headers["x-wireterm"], b"bytes");
+        assert_eq!(followed.body, final_body);
+        server.join().expect("fixture server");
+        assert_eq!(requests.recv().expect("requests").len(), 3);
+    }
+
+    #[test]
+    fn live_http_caps_response_size_and_timeout() {
+        let fixture = TestExtension::new();
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (base, _, server) = serve_responses(vec![oversized]);
+        let host = live_host(&fixture.0, BTreeMap::new(), RenderCancellation::default());
+        assert!(matches!(
+            host.http(request(base)),
+            Err(HostApiError::ResponseTooLarge)
+        ));
+        server.join().expect("oversize server");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout server");
+        let address = listener.local_addr().expect("timeout address");
+        let timeout_server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("timeout accept");
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut timed = request(format!("http://{address}/slow"));
+        timed.timeout = Duration::from_millis(25);
+        assert!(matches!(host.http(timed), Err(HostApiError::Timeout)));
+        timeout_server.join().expect("timeout server");
+    }
+
+    #[test]
+    fn named_secret_is_injected_only_at_final_http_boundary() {
+        let fixture = TestExtension::new();
+        let store = SecretStore::new(&fixture.0);
+        store.set("api-key", "never-log-this").expect("secret");
+        let (base, requests, server) = serve_responses(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let host = live_host(
+            &fixture.0,
+            BTreeMap::from([("token".to_owned(), "api-key".to_owned())]),
+            RenderCancellation::default(),
+        );
+        let mut http_request = request(base);
+        http_request.secret_headers =
+            BTreeMap::from([("Authorization".to_owned(), "token".to_owned())]);
+        host.http(http_request).expect("secret request");
+        server.join().expect("secret server");
+        let wire = requests.recv().expect("captured requests").remove(0);
+        assert!(wire.windows(14).any(|window| window == b"never-log-this"));
+        assert!(!format!("{:?}", host.secrets).contains("never-log-this"));
+        assert_eq!(HostApiError::Http.to_string(), "HTTP request failed");
+    }
+
+    #[test]
+    fn lua_sandbox_exposes_only_the_narrow_host_capabilities_and_cancels() {
+        let fixture = TestExtension::new();
+        let script = r#"
+          assert(io == nil and os == nil and package == nil and debug == nil)
+          assert(dofile == nil and loadfile == nil and require == nil)
+          return {
+            metadata = { id = "sandbox", name = "Sandbox", version = 1 },
+            inputs = {},
+            render = function()
+              while true do end
+            end,
+          }
+        "#;
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, script).expect("sandbox script");
+        let cancellation = RenderCancellation::default();
+        cancellation.cancel();
+        let host = Arc::new(live_host(&fixture.0, BTreeMap::new(), cancellation));
+        let extension = LoadedExtension::load(&script_path, host).expect("load sandbox");
+        let error = extension
+            .render_svg(&BTreeMap::new())
+            .expect_err("cancelled loop");
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn configuration_resolves_defaults_and_rejects_secret_values_in_settings() {
+        let inputs = vec![
+            ExtensionInput {
+                key: "title".to_owned(),
+                label: "Title".to_owned(),
+                kind: InputKind::Text,
+                required: true,
+                default: Value::String("Default title".to_owned()),
+                choices: Vec::new(),
+            },
+            ExtensionInput {
+                key: "token".to_owned(),
+                label: "Token".to_owned(),
+                kind: InputKind::NamedSecret,
+                required: true,
+                default: Value::Null,
+                choices: Vec::new(),
+            },
+        ];
+        let refs = BTreeMap::from([("token".to_owned(), "api-key".to_owned())]);
+        let resolved = validate_extension_configuration(
+            &inputs,
+            &BTreeMap::new(),
+            &refs,
+            &["api-key".to_owned()],
+        )
+        .expect("valid configuration");
+        assert_eq!(resolved["title"], "Default title");
+        assert!(!resolved.contains_key("token"));
+
+        let leaked = BTreeMap::from([(
+            "token".to_owned(),
+            Value::String("must-not-be-a-setting".to_owned()),
+        )]);
+        assert!(matches!(
+            validate_extension_configuration(&inputs, &leaked, &refs, &["api-key".to_owned()]),
+            Err(ExtensionError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn secret_header_redirect_does_not_cross_origins() {
+        let fixture = TestExtension::new();
+        let store = SecretStore::new(&fixture.0);
+        store.set("api-key", "never-forward").expect("secret");
+        let destination = TcpListener::bind("127.0.0.1:0").expect("destination");
+        destination.set_nonblocking(true).expect("nonblocking");
+        let destination_url = format!(
+            "http://{}/target",
+            destination.local_addr().expect("destination address")
+        );
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {destination_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (origin, _, server) = serve_responses(vec![redirect]);
+        let host = live_host(
+            &fixture.0,
+            BTreeMap::from([("token".to_owned(), "api-key".to_owned())]),
+            RenderCancellation::default(),
+        );
+        let mut http_request = request(origin);
+        http_request.max_redirects = 2;
+        http_request.secret_headers =
+            BTreeMap::from([("X-Api-Key".to_owned(), "token".to_owned())]);
+        assert_eq!(
+            host.http(http_request).expect("stopped redirect").status,
+            302
+        );
+        server.join().expect("origin server");
+        assert_eq!(
+            destination
+                .accept()
+                .expect_err("no cross-origin request")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn bundled_font_is_the_only_extension_font_and_renders_text() {
+        let mut options = resvg::usvg::Options::default();
+        load_bundled_font(&mut options);
+        assert_eq!(options.fontdb.faces().count(), 1);
+        assert_eq!(options.font_family, BUNDLED_FONT_FAMILY);
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480"><rect width="800" height="480" fill="white"/><text x="20" y="80" font-family="Missing System Font" font-size="48" fill="black">Bundled</text></svg>"#;
+        let frame = render_svg_to_panel(svg, Path::new(".")).expect("font render");
+        assert!(
+            frame
+                .preview_rgb()
+                .chunks_exact(3)
+                .any(|pixel| pixel == PanelColor::Black.rgb())
+        );
+    }
+
+    #[test]
+    fn scaffold_discovery_and_example_reach_panel_frame_with_local_http() {
+        let fixture = TestExtension::new();
+        let root = scaffold_extension(&fixture.0).expect("scaffold");
+        let discovered = discover_extensions(&fixture.0).expect("discover");
+        assert_eq!(discovered.as_slice(), std::slice::from_ref(&root));
+        let (base, _, server) = serve_responses(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"full_name\":\"local/fixture\"}".to_vec(),
+        ]);
+        let host = Arc::new(live_host(
+            &root,
+            BTreeMap::new(),
+            RenderCancellation::default(),
+        ));
+        let extension =
+            LoadedExtension::load(&root.join(EXTENSION_SCRIPT_NAME), host).expect("example load");
+        let settings = BTreeMap::from([("endpoint".to_owned(), Value::String(base))]);
+        let resolved =
+            validate_extension_configuration(&extension.inputs, &settings, &BTreeMap::new(), &[])
+                .expect("example settings");
+        let svg = extension.render_svg(&resolved).expect("example svg");
+        let frame = render_svg_to_panel(&svg, &root).expect("example frame");
+        assert_eq!(frame.payload().len(), crate::frame::FRAME_BYTES);
+        server.join().expect("example server");
     }
 }
