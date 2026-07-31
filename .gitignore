@@ -1,2 +1,3 @@
 /target/
+/dist/
 /prototype/esp32_epaper_receiver/.pio/

@@ -1,5 +1,9 @@
 # Windows extension rendering stack
 
+> Historical research, superseded by ADRs 0002 and 0003. The accepted MVP uses
+> one self-describing Lua script returning fixed SVG through a pure-Rust
+> renderer; it has no Liquid, HTML, WebView2, or child-process transform stage.
+
 ## Decision
 
 Use a host-side Rust pipeline with these components:

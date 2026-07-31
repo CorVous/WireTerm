@@ -1,5 +1,9 @@
 # Windows background playback architecture
 
+> Historical research, superseded by ADR 0001. The accepted MVP is one visible
+> foreground-only portable process with no tray, installer, updater, startup
+> task, service, or background lifetime.
+
 ## Decision
 
 Ship one per-user, tray-resident `wireterm.exe`, not a Windows service and not a

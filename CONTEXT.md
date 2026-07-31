@@ -14,7 +14,11 @@ An 800 × 480 frame consists of a 48,000-byte black plane followed by a 48,000-b
 
 ## Host renderer
 
-The Windows application that prepares a frame for the target panel, including color conversion and dithering, before serial transfer.
+The Windows application component that turns source content into a frame. Raster images are palette-dithered, while exact-palette vector and text content is composed directly.
+
+## Host bridge
+
+The single host-side owner of display-bridge discovery and serial transfer. Frame producers submit complete frames to it and do not access serial transport directly.
 
 ## Send-image workflow
 
@@ -22,15 +26,23 @@ The first host interaction: choose one image file, prepare it as a frame, and se
 
 ## Host GUI
 
-The intended first host interface is a Windows GUI for selecting an image, previewing the prepared frame, choosing a serial device, and observing transfer progress. The GUI toolkit is a short prototype decision, beginning with egui and eframe.
+The visible foreground Windows application for selecting an image, previewing the prepared frame, choosing a serial device, and observing transfer progress. Closing the window ends the host process.
 
 ## Focused sender layout
 
 The preferred WireTerm GUI direction is a deliberately simple sender: one selected image, one large panel preview, one visible device status, and one clear send action. Advanced settings remain out of the initial screen.
 
+## Extension frame rendering
+
+The host path that runs an extension script to produce fixed 800 × 480 SVG and rasterizes it in pure Rust. SVG text and vector art use exact panel colors; only raster image assets are dithered before composition.
+
 ## Display bridge firmware
 
 The intentionally thin ESP32 firmware that receives validated frames over USB serial and drives the e-paper panel; it does not perform host-side rendering work.
+
+## Receiver product name
+
+The stable human-readable identity a display bridge supplies during WireTerm/1 discovery. The Host GUI presents it with the current serial port so the receiver remains recognizable when Windows assigns a different port.
 
 ## Reference firmware
 
@@ -58,7 +70,11 @@ The operating mode in which the ESP32's Wi-Fi and Bluetooth radios remain disabl
 
 ## Extension
 
-A reusable host-side content definition that produces display content from configured data and presentation logic. An extension may be instantiated more than once with different settings.
+A reusable host-side content definition made of one self-describing Lua script plus relative local assets. The script exposes metadata, an input schema, and a render entry point, and an extension may be instantiated more than once with different settings.
+
+## Extension library
+
+The portable collection of Extension folders discoverable from the Playlist editor and available to instantiate as Playlist Items.
 
 ## Playlist
 
@@ -82,12 +98,12 @@ The minimum start-to-start time assigned to a playlist item. Its timer begins wh
 
 ## Extension capability
 
-A network host, named secret, or transform-execution privilege declared by an extension and granted independently to each playlist item. Undeclared capabilities are unavailable, and declaration changes require renewed approval.
+A bounded host operation available to an extension script, such as an HTTP request, named-secret binding, clock read, or relative local-asset lookup. Capabilities are mediated by WireTerm and granted independently to each playlist item.
 
 ## Named secret
 
-A credential value stored and injected into declared HTTP requests by WireTerm under an extension-defined name. Extension templates, transforms, response data, logs, and errors may reference the name but never receive the value.
+A credential value stored and injected into extension-requested HTTP operations by WireTerm under a script-defined logical name. Extension scripts, response data, logs, errors, and the UI may use references but never receive the value.
 
-## Transform
+## Extension host API
 
-An optional extension-local Lua function that reshapes non-secret inputs and named HTTP responses before template rendering. WireTerm supplies the Lua runtime and a data-only API; transforms cannot directly access files, processes, the environment, or the network.
+The narrow WireTerm-owned interface through which an extension script requests bounded HTTP, names credential bindings, reads the clock, and resolves relative local assets. The Lua runtime has no direct filesystem, process, environment, or network access.
