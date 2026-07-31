@@ -70,11 +70,7 @@ jobs:
 
       - name: Package binary
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist
-          Compress-Archive `
-            -Path "target/$env:TARGET/release/wireterm.exe" `
-            -DestinationPath "dist/wireterm-$env:TARGET.zip"
+        run: ./scripts/package-portable.ps1 -SkipBuild -Target $env:TARGET
 
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2

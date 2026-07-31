@@ -1,5 +1,9 @@
 # Bundled font and framework asset contract
 
+> Historical dependency research. The accepted production renderer bundles
+> Inter under OFL-1.1, disables system font discovery, and has no CSS/JavaScript
+> framework or Liquid/HTML stage.
+
 Status: decision-ready research for [issue #9](https://github.com/CorVous/WireTerm/issues/9)  
 Evidence checked: 2026-07-30
 

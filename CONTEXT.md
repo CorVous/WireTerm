@@ -68,6 +68,10 @@ The operating mode in which the ESP32's Wi-Fi and Bluetooth radios remain disabl
 
 A reusable host-side content definition made of one self-describing Lua script plus relative local assets. The script exposes metadata, an input schema, and a render entry point, and an extension may be instantiated more than once with different settings.
 
+## Extension library
+
+The portable collection of Extension folders discoverable from the Playlist editor and available to instantiate as Playlist Items.
+
 ## Playlist
 
 An ordered collection of playlist items that the host cycles through on the connected display.

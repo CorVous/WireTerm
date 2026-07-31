@@ -16,16 +16,23 @@ Install the stable Rust toolchain, then:
 cargo run
 ```
 
-For a portable executable:
+For the unsigned Windows 11 portable ZIP:
 
 ```text
-cargo build --release
+powershell -ExecutionPolicy Bypass -File scripts/package-portable.ps1
 ```
 
-Copy `target/release/wireterm.exe` wherever it should run. No installer or
-machine-wide configuration is required. WireTerm stores immutable, atomic
-Playlist revisions under the adjacent `wireterm-data/playlist-revisions`
-folder so the executable and state remain portable together.
+Extract the ZIP and run `wireterm.exe`. Windows may show a SmartScreen warning
+because the MVP archive is unsigned. There is no installer or machine-wide
+configuration. WireTerm stores immutable, atomic Playlist and named-secret
+revisions under the adjacent `wireterm-data` folder, so deleting the extracted
+folder removes the executable and all WireTerm-owned state.
+
+To update manually, close WireTerm and replace `wireterm.exe` plus the shipped
+documentation/font/example files while preserving `wireterm-data`. To remove
+WireTerm, close it and delete the extracted folder. There is no updater,
+registry entry, startup task, service, tray process, or OS-owned credential
+record to clean up.
 
 ## Playlist and playback
 
@@ -70,17 +77,22 @@ assets. The script returns a table with:
   settings shown by the editor;
 - `render(context)`: a function that returns valid fixed 800 × 480 SVG.
 
-The Lua sandbox has no direct filesystem, process, environment, or network
-access. Its narrow `wireterm` API provides bounded HTTP requests, opaque
+The Lua sandbox allowlists only coroutine/table/string/UTF-8/math helpers and
+has no direct filesystem, process, environment, package, or network access.
+Its narrow `wireterm` API provides bounded live HTTP requests, opaque
 named-secret bindings, clock reads, and validated relative asset paths.
 Response bodies are arbitrary bytes and capped at 5 MiB; request timeouts cap
 at 60 seconds, Lua execution caps at 30 seconds and 64 MiB, and returned SVG
 caps at 2 MiB. Secret values never enter Lua, the Playlist, the UI, or errors.
 
-This slice ships and tests the complete deterministic local-fixture host API.
-Live HTTP execution and app-owned secret-value storage/injection are deliberate
-remaining work; the GUI does not substitute unbounded networking or expose
-secret values. Extensions that do not require HTTP can render locally now.
+The foreground app performs HTTP on its bounded render worker, defaults to
+denying redirects, and retains normal TLS certificate and hostname validation.
+MVP named-secret values are stored locally without encryption in adjacent
+immutable revisions and injected only at the final outgoing-header boundary.
+Protect access to the portable folder accordingly. The editor discovers and scaffolds Extensions under
+`wireterm-data/extensions`; see
+[`docs/extension-author-guide.md`](docs/extension-author-guide.md) and the
+shipped [`examples/http-extension`](examples/http-extension).
 
 SVG is parsed and rendered through pure Rust. Vector/text composition is mapped
 directly to black/white/red without whole-frame error diffusion. Relative
@@ -117,4 +129,5 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo build --release
+powershell -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -SkipBuild
 ```

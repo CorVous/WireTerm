@@ -1,5 +1,10 @@
 # GitHub reference extension data contract
 
+> Historical reference-shape research, superseded by ADR 0003. Production
+> Extensions choose their own bounded HTTP requests and interpret arbitrary
+> response bytes in one self-describing Lua script; there is no host-declared
+> URL, transform, or template-facing response contract.
+
 Status: recommended for the playlist/extension MVP
 Research ticket: [#10](https://github.com/CorVous/WireTerm/issues/10)
 
