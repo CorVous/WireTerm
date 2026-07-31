@@ -1084,6 +1084,9 @@ mod tests {
 
     use super::*;
 
+    const GITHUB_OPEN_PRS_LUA: &str =
+        include_str!("../examples/extensions/github-open-prs/extension.lua");
+
     struct TestExtension(PathBuf);
 
     impl TestExtension {
@@ -1502,6 +1505,158 @@ mod tests {
                 .chunks_exact(3)
                 .any(|pixel| pixel == PanelColor::Black.rgb())
         );
+    }
+
+    #[test]
+    fn github_open_prs_example_renders_deterministic_fixture_without_secret_leakage() {
+        let fixture = TestExtension::new();
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
+        let url = "https://api.github.com/search/issues?q=type%3Apr%20state%3Aopen%20author%3ACorVous&sort=updated&order=desc&per_page=5";
+        let response = br#"{
+          "total_count": 7,
+          "incomplete_results": false,
+          "items": [
+            {
+              "number": 42,
+              "title": "Fix <parser> & \"quotes\" \ud83d\ude80",
+              "updated_at": "2026-07-30T12:00:00Z",
+              "repository_url": "https://api.github.com/repos/example/private-repo"
+            },
+            {
+              "number": 7,
+              "title": null,
+              "updated_at": null,
+              "repository_url": null
+            }
+          ]
+        }"#;
+        let secret_name = "fixture-github-authorization";
+        let secret_refs = BTreeMap::from([("github_token".to_owned(), secret_name.to_owned())]);
+        let host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs.clone(),
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 200,
+                    headers: BTreeMap::from([("x-ratelimit-remaining".to_owned(), b"29".to_vec())]),
+                    body: response.to_vec(),
+                },
+            ),
+        );
+        let extension =
+            LoadedExtension::load(&script_path, host.clone()).expect("load GitHub example");
+        let settings =
+            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
+        let resolved = validate_extension_configuration(
+            &extension.inputs,
+            &settings,
+            &secret_refs,
+            &[secret_name.to_owned()],
+        )
+        .expect("valid GitHub example settings");
+        let svg = extension.render_svg(&resolved).expect("GitHub fixture SVG");
+
+        assert!(svg.contains("example/private-repo"));
+        assert!(svg.contains("#42"));
+        assert!(svg.contains("Fix &lt;parser&gt; &amp; &quot;quotes&quot; 🚀"));
+        assert!(svg.contains("(untitled pull request)"));
+        assert!(!svg.contains(secret_name));
+        assert!(!resolved.contains_key("github_token"));
+        let frame = render_svg_to_panel(&svg, &fixture.0).expect("GitHub fixture frame");
+        assert_eq!(frame.payload().len(), crate::frame::FRAME_BYTES);
+
+        let requests = host.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, url);
+        assert_eq!(request.headers["Accept"], "application/vnd.github+json");
+        assert_eq!(request.headers["X-GitHub-Api-Version"], "2022-11-28");
+        assert_eq!(
+            request.headers["User-Agent"],
+            "WireTerm-GitHub-Open-PRs/1.0"
+        );
+        assert_eq!(request.secret_headers["Authorization"], secret_name);
+        assert!(!request.url.contains(secret_name));
+    }
+
+    #[test]
+    fn github_open_prs_example_handles_empty_and_rate_limited_responses() {
+        let fixture = TestExtension::new();
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
+        let url = "https://api.github.com/search/issues?q=type%3Apr%20state%3Aopen%20author%3ACorVous&sort=updated&order=desc&per_page=5";
+        let secret_refs = BTreeMap::from([(
+            "github_token".to_owned(),
+            "fixture-github-authorization".to_owned(),
+        )]);
+        let settings =
+            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
+
+        let empty_host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs.clone(),
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: br#"{"total_count":0,"incomplete_results":false,"items":[]}"#.to_vec(),
+                },
+            ),
+        );
+        let empty_extension =
+            LoadedExtension::load(&script_path, empty_host).expect("load empty example");
+        let empty_svg = empty_extension
+            .render_svg(&settings)
+            .expect("empty GitHub SVG");
+        assert!(empty_svg.contains("No open pull requests"));
+        render_svg_to_panel(&empty_svg, &fixture.0).expect("empty GitHub frame");
+
+        let rate_host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs,
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 403,
+                    headers: BTreeMap::from([("x-ratelimit-remaining".to_owned(), b"0".to_vec())]),
+                    body: br#"{"message":"must-not-appear"}"#.to_vec(),
+                },
+            ),
+        );
+        let rate_extension =
+            LoadedExtension::load(&script_path, rate_host).expect("load rate-limit example");
+        let error = rate_extension
+            .render_svg(&settings)
+            .expect_err("rate limit must fail safely")
+            .to_string();
+        assert!(error.contains("rate limit"));
+        assert!(!error.contains("must-not-appear"));
+        assert!(!error.contains("api.github.com"));
     }
 
     #[test]
