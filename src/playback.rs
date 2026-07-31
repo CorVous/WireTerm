@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn interval_is_start_to_start_and_edits_wait_for_boundary() {
+    fn reordered_revision_waits_for_boundary_and_preserves_current_identity() {
         let mut playlist = playlist(2);
         playlist.default_interval_minutes = 1;
         playlist.revision = 1;
@@ -356,11 +356,16 @@ mod tests {
         let mut playback = PlaybackController::new_running();
         let first = playback.poll(&playlist, now, true).expect("first turn");
         assert_eq!(first.item.title, "Item 0");
+        let current_id = first.item.id;
+        let next_id = playlist.items[1].id;
+
+        assert!(playlist.move_item_to(next_id, current_id, false));
+        playlist.revision = 2;
+        assert_eq!(playback.current_item(), Some(current_id));
+        assert!(playback.poll(&playlist, now, true).is_none());
+
         playback.rendered();
         playback.send_succeeded();
-
-        playlist.items.swap(0, 1);
-        playlist.revision = 2;
         assert!(
             playback
                 .poll(&playlist, now + Duration::from_secs(59), true)
@@ -370,6 +375,7 @@ mod tests {
             .poll(&playlist, now + Duration::from_mins(1), true)
             .expect("boundary");
         assert_eq!(next.revision, 2);
+        assert_eq!(next.item.id, next_id);
         assert_eq!(next.item.title, "Item 1");
     }
 

@@ -93,6 +93,7 @@ struct WireTermApp {
     store: PlaylistStore,
     playlist: PlaylistRevision,
     selected_item: Option<ItemId>,
+    dragged_item: Option<ItemId>,
     interval_edits: HashMap<ItemId, String>,
     extension_schemas: HashMap<ItemId, (ExtensionMetadata, Vec<ExtensionInput>)>,
     playback: PlaybackController,
@@ -137,6 +138,7 @@ impl WireTermApp {
             store,
             playlist,
             selected_item,
+            dragged_item: None,
             interval_edits: HashMap::new(),
             extension_schemas: HashMap::new(),
             playback,
@@ -427,29 +429,12 @@ impl WireTermApp {
     }
 
     fn move_item_to(&mut self, dragged_id: ItemId, target_id: ItemId, after_target: bool) {
-        let Some(source_index) = self
+        if self
             .playlist
-            .items
-            .iter()
-            .position(|item| item.id == dragged_id)
-        else {
-            return;
-        };
-        let item = self.playlist.items.remove(source_index);
-        let Some(mut target_index) = self
-            .playlist
-            .items
-            .iter()
-            .position(|candidate| candidate.id == target_id)
-        else {
-            self.playlist.items.insert(source_index, item);
-            return;
-        };
-        if after_target {
-            target_index += 1;
+            .move_item_to(dragged_id, target_id, after_target)
+        {
+            self.save_playlist();
         }
-        self.playlist.items.insert(target_index, item);
-        self.save_playlist();
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -507,6 +492,30 @@ impl WireTermApp {
 
         let current = self.playback.current_item();
         let mut drop_action = None;
+        let pointer_events = ui.ctx().input(|input| input.events.clone());
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos());
+        let pressed_at = pointer_events.iter().find_map(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } => Some(*pos),
+            _ => None,
+        });
+        let released_at = pointer_events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } => Some(*pos),
+            _ => None,
+        });
+        if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.dragged_item = None;
+        }
+        let mut drop_rows = Vec::with_capacity(self.playlist.items.len());
         egui::ScrollArea::horizontal()
             .id_salt("playlist-table-x")
             .auto_shrink([false, true])
@@ -592,11 +601,17 @@ impl WireTermApp {
                             let handle = handle
                                 .on_hover_cursor(egui::CursorIcon::Grab)
                                 .on_hover_text("Drag to reorder");
-                            handle.dnd_set_drag_payload(item.id);
-                            let is_drop_target = handle
-                                .dnd_hover_payload::<ItemId>()
-                                .is_some_and(|payload| *payload != item.id);
-                            let is_active = handle.dragged();
+                            let row_drop_rect = egui::Rect::from_min_max(
+                                egui::pos2(ui.clip_rect().left(), handle.rect.top() - 3.5),
+                                egui::pos2(handle.rect.right(), handle.rect.bottom() + 3.5),
+                            );
+                            drop_rows.push((item.id, handle.rect, row_drop_rect));
+                            let is_active = self.dragged_item == Some(item.id) || handle.dragged();
+                            let is_drop_target = self.dragged_item.is_some_and(|dragged_id| {
+                                dragged_id != item.id
+                                    && pointer
+                                        .is_some_and(|pointer| row_drop_rect.contains(pointer))
+                            });
                             if is_active {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                             }
@@ -640,10 +655,8 @@ impl WireTermApp {
                                     );
                                 }
                             }
-                            let after_target = ui
-                                .ctx()
-                                .pointer_interact_pos()
-                                .is_some_and(|pointer| pointer.y > handle.rect.center().y);
+                            let after_target =
+                                pointer.is_some_and(|pointer| pointer.y > handle.rect.center().y);
                             if is_drop_target {
                                 let y = if after_target {
                                     handle.rect.bottom() + 2.0
@@ -658,13 +671,33 @@ impl WireTermApp {
                                     Stroke::new(2.0_f32, ACCENT),
                                 );
                             }
-                            if let Some(payload) = handle.dnd_release_payload::<ItemId>() {
-                                drop_action = Some((*payload, item.id, after_target));
-                            }
                             ui.end_row();
                         }
                     });
             });
+
+        if let Some(pressed_at) = pressed_at
+            && let Some((item_id, _, _)) = drop_rows
+                .iter()
+                .find(|(_, handle_rect, _)| handle_rect.contains(pressed_at))
+        {
+            self.dragged_item = Some(*item_id);
+        }
+        if let Some(released_at) = released_at {
+            if let Some(dragged_id) = self.dragged_item
+                && let Some((target_id, handle_rect, _)) = drop_rows
+                    .iter()
+                    .find(|(_, _, row_rect)| row_rect.contains(released_at))
+                && dragged_id != *target_id
+            {
+                drop_action = Some((
+                    dragged_id,
+                    *target_id,
+                    released_at.y > handle_rect.center().y,
+                ));
+            }
+            self.dragged_item = None;
+        }
         if let Some((dragged_id, target_id, after_target)) = drop_action {
             self.move_item_to(dragged_id, target_id, after_target);
         }

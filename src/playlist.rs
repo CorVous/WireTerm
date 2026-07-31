@@ -63,6 +63,39 @@ impl PlaylistRevision {
         id
     }
 
+    /// Move one stable Playlist Item identity relative to another.
+    ///
+    /// Returns `true` only when the order changed. Revision numbers remain the
+    /// responsibility of [`PlaylistStore::save_new_revision`].
+    pub fn move_item_to(
+        &mut self,
+        dragged_id: ItemId,
+        target_id: ItemId,
+        after_target: bool,
+    ) -> bool {
+        let Some(source_index) = self.items.iter().position(|item| item.id == dragged_id) else {
+            return false;
+        };
+        let Some(target_index) = self.items.iter().position(|item| item.id == target_id) else {
+            return false;
+        };
+        if source_index == target_index {
+            return false;
+        }
+
+        let mut destination = target_index + usize::from(after_target);
+        if source_index < destination {
+            destination -= 1;
+        }
+        if source_index == destination {
+            return false;
+        }
+
+        let item = self.items.remove(source_index);
+        self.items.insert(destination, item);
+        true
+    }
+
     #[must_use]
     pub fn effective_interval_minutes(&self, item: &PlaylistItem) -> u16 {
         item.interval_minutes
@@ -583,6 +616,96 @@ mod tests {
                 .expect("revisions")
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn reorder_moves_stable_item_identities_up_and_down() {
+        let mut playlist = PlaylistRevision::default();
+        let first = playlist.add_item(
+            "First".to_owned(),
+            PlaylistSource::Image {
+                path: "first.png".into(),
+            },
+        );
+        let second = playlist.add_item(
+            "Second".to_owned(),
+            PlaylistSource::Image {
+                path: "second.png".into(),
+            },
+        );
+        let third = playlist.add_item(
+            "Third".to_owned(),
+            PlaylistSource::Image {
+                path: "third.png".into(),
+            },
+        );
+
+        assert!(playlist.move_item_to(first, third, true));
+        assert_eq!(
+            playlist
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            [second, third, first]
+        );
+        assert!(playlist.move_item_to(first, second, false));
+        assert_eq!(
+            playlist
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert!(!playlist.move_item_to(second, third, false));
+        assert_eq!(
+            playlist
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            [first, second, third]
+        );
+    }
+
+    #[test]
+    fn reordered_revision_persists_atomically() {
+        let directory = TestDirectory::new("reorder-revision");
+        let store = PlaylistStore::new(&directory.0);
+        let mut playlist = PlaylistRevision::default();
+        let first = playlist.add_item(
+            "First".to_owned(),
+            PlaylistSource::Image {
+                path: "first.png".into(),
+            },
+        );
+        let second = playlist.add_item(
+            "Second".to_owned(),
+            PlaylistSource::Image {
+                path: "second.png".into(),
+            },
+        );
+        let saved = store.save_new_revision(playlist).expect("initial revision");
+
+        let mut reordered = saved.clone();
+        assert!(reordered.move_item_to(second, first, false));
+        let reordered = store
+            .save_new_revision(reordered)
+            .expect("reordered revision");
+        let loaded = store.load_latest().expect("latest revision");
+
+        assert_eq!(saved.revision, 1);
+        assert_eq!(reordered.revision, 2);
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(
+            loaded.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [second, first]
+        );
+        assert_eq!(
+            saved.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [first, second]
         );
     }
 
