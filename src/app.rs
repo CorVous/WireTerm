@@ -121,7 +121,7 @@ impl WireTermApp {
     fn new() -> Self {
         let store = PlaylistStore::adjacent_to_executable()
             .unwrap_or_else(|_| PlaylistStore::new(Path::new("wireterm-data")));
-        let (mut playlist, issue) = match store.load_latest() {
+        let (mut playlist, issue) = match store.load_or_initialize_default() {
             Ok(playlist) => (playlist, None),
             Err(error) => (
                 PlaylistRevision::default(),
@@ -285,12 +285,14 @@ impl WireTermApp {
 
     fn resolve_playback_source(&mut self, item: &PlaylistItem) -> Result<PathBuf, String> {
         match &item.source {
-            PlaylistSource::Image { path } => Ok(path.clone()),
+            PlaylistSource::Image { path } => Ok(self.store.resolve_source_path(path)),
             PlaylistSource::ImageFolder { path } => self
                 .shuffle_bags
-                .resolve_turn(item.id, path)
+                .resolve_turn(item.id, &self.store.resolve_source_path(path))
                 .map_err(|error| error.to_string()),
-            PlaylistSource::Extension { path, .. } => Ok(extension_script_path(path)),
+            PlaylistSource::Extension { path, .. } => {
+                Ok(extension_script_path(&self.store.resolve_source_path(path)))
+            }
         }
     }
 
@@ -302,9 +304,15 @@ impl WireTermApp {
             return;
         };
         let path = match &item.source {
-            PlaylistSource::Image { path } => Ok(path.clone()),
-            PlaylistSource::ImageFolder { .. } => FolderShuffleBags::preview(&item.source),
-            PlaylistSource::Extension { path, .. } => Ok(extension_script_path(path)),
+            PlaylistSource::Image { path } => Ok(self.store.resolve_source_path(path)),
+            PlaylistSource::ImageFolder { path } => {
+                FolderShuffleBags::preview(&PlaylistSource::ImageFolder {
+                    path: self.store.resolve_source_path(path),
+                })
+            }
+            PlaylistSource::Extension { path, .. } => {
+                Ok(extension_script_path(&self.store.resolve_source_path(path)))
+            }
         };
         match path {
             Ok(path) => self.spawn_render(item, path, RenderPurpose::Preview),

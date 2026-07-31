@@ -28,6 +28,14 @@ configuration. WireTerm stores immutable, atomic Playlist and named-secret
 revisions under the adjacent `wireterm-data` folder, so deleting the extracted
 folder removes the executable and all WireTerm-owned state.
 
+On a fresh extraction with no Playlist revision, WireTerm creates revision 1
+with one enabled **Red image collection** folder Item. It uses the normal
+15-minute default interval and session-reset, non-recursive shuffle bag over
+the bundled `wireterm-data/images/default-playlist` JPEGs. Existing Playlist
+revisions always win, so updating package files does not replace user edits.
+Image credits and the supplied-metadata caveat are in
+[`docs/default-playlist-attribution.md`](docs/default-playlist-attribution.md).
+
 To update manually, close WireTerm and replace `wireterm.exe` plus the shipped
 documentation/font/example files while preserving `wireterm-data`. To remove
 WireTerm, close it and delete the extracted folder. There is no updater,
