@@ -71,7 +71,7 @@ pub fn prepare_raster_image(source: &RgbImage) -> Result<PanelFrame, RasterError
         ];
     }
 
-    let classes = dither_to_palette(&mut working);
+    let classes = dither_to_palette(&mut working, FRAME_WIDTH, FRAME_HEIGHT);
     let pixels: Vec<_> = classes
         .into_iter()
         .map(|class| match class {
@@ -81,6 +81,36 @@ pub fn prepare_raster_image(source: &RgbImage) -> Result<PanelFrame, RasterError
         })
         .collect();
     PanelFrame::from_palette_pixels(&pixels).map_err(Into::into)
+}
+
+/// Dither one raster asset before it is composed into an SVG frame.
+///
+/// Unlike [`prepare_raster_image`], this preserves the asset dimensions and
+/// adds no panel-sized letterboxing. The SVG renderer remains responsible for
+/// placement and composition.
+#[must_use]
+pub fn dither_raster_asset(source: &RgbImage) -> RgbImage {
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+    let mut working = source
+        .pixels()
+        .map(|pixel| {
+            [
+                f32::from(pixel[0]),
+                f32::from(pixel[1]),
+                f32::from(pixel[2]),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let classes = dither_to_palette(&mut working, width, height);
+    RgbImage::from_fn(source.width(), source.height(), |x, y| {
+        let color = match classes[y as usize * width + x as usize] {
+            0 => PanelColor::Black,
+            2 => PanelColor::Red,
+            _ => PanelColor::White,
+        };
+        image::Rgb(color.rgb())
+    })
 }
 
 fn contain_dimensions(source_width: u32, source_height: u32) -> Result<(u32, u32), RasterError> {
@@ -191,11 +221,11 @@ fn fill_region(
     }
 }
 
-fn dither_to_palette(working: &mut [[f32; 3]]) -> Vec<u8> {
-    let mut classes = vec![1_u8; PIXEL_COUNT];
-    for y in 0..FRAME_HEIGHT {
-        for x in 0..FRAME_WIDTH {
-            let index = y * FRAME_WIDTH + x;
+fn dither_to_palette(working: &mut [[f32; 3]], width: usize, height: usize) -> Vec<u8> {
+    let mut classes = vec![1_u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
             let old = working[index];
             let (class, chosen) = PALETTE
                 .iter()
@@ -207,10 +237,10 @@ fn dither_to_palette(working: &mut [[f32; 3]]) -> Vec<u8> {
                 .expect("palette is non-empty");
             classes[index] = class;
             let error = [old[0] - chosen[0], old[1] - chosen[1], old[2] - chosen[2]];
-            diffuse_error(working, x, y, 1, 0, error, 7.0 / 16.0);
-            diffuse_error(working, x, y, -1, 1, error, 3.0 / 16.0);
-            diffuse_error(working, x, y, 0, 1, error, 5.0 / 16.0);
-            diffuse_error(working, x, y, 1, 1, error, 1.0 / 16.0);
+            diffuse_error(working, (width, height), (x, y), (1, 0), error, 7.0 / 16.0);
+            diffuse_error(working, (width, height), (x, y), (-1, 1), error, 3.0 / 16.0);
+            diffuse_error(working, (width, height), (x, y), (0, 1), error, 5.0 / 16.0);
+            diffuse_error(working, (width, height), (x, y), (1, 1), error, 1.0 / 16.0);
         }
     }
     classes
@@ -225,20 +255,21 @@ fn color_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
 
 fn diffuse_error(
     pixels: &mut [[f32; 3]],
-    x: usize,
-    y: usize,
-    dx: isize,
-    dy: isize,
+    size: (usize, usize),
+    position: (usize, usize),
+    delta: (isize, isize),
     error: [f32; 3],
     factor: f32,
 ) {
+    let (width, height) = size;
+    let (x, y) = position;
+    let (dx, dy) = delta;
     let next_x = x as isize + dx;
     let next_y = y as isize + dy;
-    if next_x < 0 || next_y < 0 || next_x >= FRAME_WIDTH as isize || next_y >= FRAME_HEIGHT as isize
-    {
+    if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
         return;
     }
-    let pixel = &mut pixels[next_y as usize * FRAME_WIDTH + next_x as usize];
+    let pixel = &mut pixels[next_y as usize * width + next_x as usize];
     for channel in 0..3 {
         pixel[channel] = error[channel]
             .mul_add(factor, pixel[channel])

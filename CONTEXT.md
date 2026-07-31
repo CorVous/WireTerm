@@ -34,7 +34,7 @@ The preferred WireTerm GUI direction is a deliberately simple sender: one select
 
 ## Extension frame rendering
 
-The future host path that evaluates Liquid into a fixed 800 × 480 SVG and rasterizes it in pure Rust. SVG text and vector art use exact panel colors; only raster image assets are dithered before composition.
+The host path that runs an extension script to produce fixed 800 × 480 SVG and rasterizes it in pure Rust. SVG text and vector art use exact panel colors; only raster image assets are dithered before composition.
 
 ## Display bridge firmware
 
@@ -66,7 +66,7 @@ The operating mode in which the ESP32's Wi-Fi and Bluetooth radios remain disabl
 
 ## Extension
 
-A reusable host-side content definition that produces display content from configured data and presentation logic. An extension may be instantiated more than once with different settings.
+A reusable host-side content definition made of one self-describing Lua script plus relative local assets. The script exposes metadata, an input schema, and a render entry point, and an extension may be instantiated more than once with different settings.
 
 ## Playlist
 
@@ -90,12 +90,12 @@ The minimum start-to-start time assigned to a playlist item. Its timer begins wh
 
 ## Extension capability
 
-A network host, named secret, or transform-execution privilege declared by an extension and granted independently to each playlist item. Undeclared capabilities are unavailable, and declaration changes require renewed approval.
+A bounded host operation available to an extension script, such as an HTTP request, named-secret binding, clock read, or relative local-asset lookup. Capabilities are mediated by WireTerm and granted independently to each playlist item.
 
 ## Named secret
 
-A credential value stored and injected into declared HTTP requests by WireTerm under an extension-defined name. Extension templates, transforms, response data, logs, and errors may reference the name but never receive the value.
+A credential value stored and injected into extension-requested HTTP operations by WireTerm under a script-defined logical name. Extension scripts, response data, logs, errors, and the UI may use references but never receive the value.
 
-## Transform
+## Extension host API
 
-An optional extension-local Lua function that reshapes non-secret inputs and named HTTP responses before template rendering. WireTerm supplies the Lua runtime and a data-only API; transforms cannot directly access files, processes, the environment, or the network.
+The narrow WireTerm-owned interface through which an extension script requests bounded HTTP, names credential bindings, reads the clock, and resolves relative local assets. The Lua runtime has no direct filesystem, process, environment, or network access.

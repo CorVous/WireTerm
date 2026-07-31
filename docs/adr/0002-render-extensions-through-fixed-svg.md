@@ -1,7 +1,7 @@
 ---
-status: accepted
+status: superseded by ADR-0003
 ---
 
 # Render extensions through fixed SVG
 
-Future extensions evaluate Liquid into a fixed 800 × 480 SVG and rasterize it with a pure-Rust renderer. Text and vector art map directly to the B/W/red panel palette and only raster image assets are dithered before composition, replacing the earlier WebView2/HTML capture direction and preventing full-frame dithering from degrading authored glyphs and line art.
+Extensions render through a fixed 800 × 480 SVG and pure-Rust renderer. The SVG boundary and hybrid palette conversion remain accepted, but ADR-0003 supersedes this ADR's former Liquid stage.
