@@ -1,6 +1,6 @@
 # Default red-image Playlist attribution
 
-The 18 JPEGs in `wireterm-data/images/default-playlist` were supplied for the
+The 16 JPEGs in `wireterm-data/images/default-playlist` were supplied for the
 WireTerm default Playlist as Unsplash images. The files contain no embedded
 artist, copyright, description, or license metadata. The photographer labels
 and Unsplash photo IDs below are therefore transcribed only from the supplied
@@ -10,21 +10,20 @@ The images are distributed subject to the [Unsplash License](https://unsplash.co
 Confirm the source page and current terms before redistributing them outside a
 WireTerm package.
 
-The packaged files are the supplied images cropped and resized without other
-visual edits. Each JPEG was reviewed and independently validated at exactly
-800 × 480 pixels before packaging. Crop coordinates and review contact sheets
-are build evidence only and are intentionally excluded from the direct image
-folder consumed by the non-recursive Playlist Item.
+The packaged files are the supplied images cropped and resized to 800 × 480.
+Seven files also use deterministic tone, contrast, or color adjustments chosen
+after physical review on the target panel; no pixels were synthesized,
+inpainted, moved, or recropped during that tuning. Review comparisons and
+intermediate candidates are build evidence only and are intentionally excluded
+from the direct image folder consumed by the non-recursive Playlist Item.
 
 | Supplied photographer label | Photo |
 | --- | --- |
 | `abu-sayed-mohammad-tamanna` | [0Nrk3XNOWkc](https://unsplash.com/photos/0Nrk3XNOWkc) |
-| `anh-tuan-to` | [02tLCkWWSrk](https://unsplash.com/photos/02tLCkWWSrk) |
 | `ashish-kumar` | [UrNslyuxH6k](https://unsplash.com/photos/UrNslyuxH6k) |
 | `bhautik-patel` | [9Dat9vc-WUE](https://unsplash.com/photos/9Dat9vc-WUE) |
 | `elyssa` | [6o_eitnR-3o](https://unsplash.com/photos/6o_eitnR-3o) |
 | `flyd` | [EgLcslj8FX4](https://unsplash.com/photos/EgLcslj8FX4) |
-| `ganapathy-kumar` | [Y3quvtI_LJE](https://unsplash.com/photos/Y3quvtI_LJE) |
 | `girl-with-red-hat` | [V7ZJZ2hq2XY](https://unsplash.com/photos/V7ZJZ2hq2XY) |
 | `grant-mccurdy` | [KOKxOB8550Q](https://unsplash.com/photos/KOKxOB8550Q) |
 | `h-co` | [3JFVNo4ukKQ](https://unsplash.com/photos/3JFVNo4ukKQ) |

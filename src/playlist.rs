@@ -826,7 +826,7 @@ mod tests {
     fn bundled_default_folder_is_exact_and_fully_decodable() {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/default-playlist");
         let images = scan_image_folder(&folder).expect("scan bundled images");
-        assert_eq!(images.len(), 18);
+        assert_eq!(images.len(), 16);
         assert_eq!(
             fs::read_dir(&folder).expect("read bundled folder").count(),
             images.len(),

@@ -61,8 +61,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stagingRoot "wireterm-data
 
 $defaultImageSource = Join-Path $repoRoot "assets\default-playlist"
 $defaultImages = @(Get-ChildItem -LiteralPath $defaultImageSource -File)
-if ($defaultImages.Count -ne 18) {
-    throw "default Playlist image folder must contain exactly 18 files"
+if ($defaultImages.Count -ne 16) {
+    throw "default Playlist image folder must contain exactly 16 files"
 }
 $unsupportedDefaultImages = @($defaultImages | Where-Object {
     $_.Extension.ToLowerInvariant() -ne ".jpg"
