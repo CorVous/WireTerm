@@ -57,6 +57,7 @@ pub fn run() -> eframe::Result<()> {
 }
 
 struct PreparedPreview {
+    item_id: ItemId,
     frame: Arc<PanelFrame>,
     texture: egui::TextureHandle,
     label: String,
@@ -93,6 +94,7 @@ struct ExtensionSchemaTask {
 }
 
 struct PendingTransfer {
+    item_id: ItemId,
     label: String,
     frame: Arc<PanelFrame>,
 }
@@ -203,11 +205,13 @@ impl WireTermApp {
                 match rendered.result {
                     Ok(frame) => match rendered.purpose {
                         RenderPurpose::Preview => {
-                            self.set_preview(ctx, frame, rendered.label);
+                            if preview_matches_selection(self.selected_item, rendered.item_id) {
+                                self.set_preview(ctx, rendered.item_id, frame, rendered.label);
+                            }
                         }
                         RenderPurpose::Playback => {
                             self.playback.rendered();
-                            self.begin_transfer(frame, rendered.label);
+                            self.begin_transfer(rendered.item_id, frame, rendered.label);
                         }
                     },
                     Err(error) => {
@@ -291,6 +295,13 @@ impl WireTermApp {
     fn select_item(&mut self, item_id: ItemId) {
         if self.selected_item != Some(item_id) {
             self.extension_schema_errors.remove(&item_id);
+            if self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.item_id != item_id)
+            {
+                self.preview = None;
+            }
         }
         self.selected_item = Some(item_id);
     }
@@ -314,7 +325,14 @@ impl WireTermApp {
                     self.host_status = transfer_status(&stage);
                     if stage == TransferStage::Complete {
                         if let Some(transfer) = self.pending_transfer.take() {
-                            self.set_preview(ctx, (*transfer.frame).clone(), transfer.label);
+                            if preview_matches_selection(self.selected_item, transfer.item_id) {
+                                self.set_preview(
+                                    ctx,
+                                    transfer.item_id,
+                                    (*transfer.frame).clone(),
+                                    transfer.label,
+                                );
+                            }
                             self.playback.send_succeeded();
                         }
                         let _ = self.host.refresh_devices();
@@ -452,7 +470,7 @@ impl WireTermApp {
             .expect("item render worker should start");
     }
 
-    fn begin_transfer(&mut self, frame: PanelFrame, label: String) {
+    fn begin_transfer(&mut self, item_id: ItemId, frame: PanelFrame, label: String) {
         let Some(port) = self.selected_port.clone() else {
             self.playback.failed(&self.playlist, Instant::now(), true);
             self.record_issue(
@@ -466,7 +484,11 @@ impl WireTermApp {
             Ok(()) => {
                 self.transfer_progress = 0.0;
                 "Connecting…".clone_into(&mut self.host_status);
-                self.pending_transfer = Some(PendingTransfer { label, frame });
+                self.pending_transfer = Some(PendingTransfer {
+                    item_id,
+                    label,
+                    frame,
+                });
             }
             Err(error) => {
                 self.playback.failed(&self.playlist, Instant::now(), false);
@@ -475,7 +497,13 @@ impl WireTermApp {
         }
     }
 
-    fn set_preview(&mut self, ctx: &egui::Context, frame: PanelFrame, label: String) {
+    fn set_preview(
+        &mut self,
+        ctx: &egui::Context,
+        item_id: ItemId,
+        frame: PanelFrame,
+        label: String,
+    ) {
         let image = egui::ColorImage::from_rgb([FRAME_WIDTH, FRAME_HEIGHT], frame.preview_rgb());
         let texture = ctx.load_texture(
             format!("playlist-preview-{}", frame.crc32()),
@@ -483,6 +511,7 @@ impl WireTermApp {
             egui::TextureOptions::NEAREST,
         );
         self.preview = Some(PreparedPreview {
+            item_id,
             frame: Arc::new(frame),
             texture,
             label,
@@ -569,6 +598,13 @@ impl WireTermApp {
         self.interval_edits.remove(&id);
         self.extension_schemas.remove(&id);
         self.extension_schema_errors.remove(&id);
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.item_id == id)
+        {
+            self.preview = None;
+        }
         if self
             .extension_schema_task
             .as_ref()
@@ -1537,6 +1573,10 @@ fn visual_qa_playlist() -> PlaylistRevision {
     playlist
 }
 
+fn preview_matches_selection(selected_item: Option<ItemId>, rendered_item: ItemId) -> bool {
+    selected_item == Some(rendered_item)
+}
+
 fn transfer_status(stage: &TransferStage) -> String {
     match stage {
         TransferStage::Connecting => "Connecting…".to_owned(),
@@ -1570,5 +1610,26 @@ mod tests {
             "unexpected device response during handshake".starts_with("unexpected device response")
         );
         assert!(!"could not open COM4".starts_with("unexpected device response"));
+    }
+
+    #[test]
+    fn preview_updates_only_for_the_selected_playlist_item() {
+        let mut playlist = PlaylistRevision::default();
+        let selected = playlist.add_item(
+            "Selected".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("selected.png"),
+            },
+        );
+        let other = playlist.add_item(
+            "Other".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("other.png"),
+            },
+        );
+
+        assert!(preview_matches_selection(Some(selected), selected));
+        assert!(!preview_matches_selection(Some(selected), other));
+        assert!(!preview_matches_selection(None, selected));
     }
 }
