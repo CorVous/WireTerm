@@ -1,4 +1,4 @@
-//! Visible foreground `WireTerm` Playlist editor and playback host.
+//! `WireTerm` Playlist editor and playback host with a Windows tray lifetime.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -18,6 +18,8 @@ use eframe::egui::{
 };
 use serde_json::Value;
 
+#[cfg(target_os = "windows")]
+use crate::tray::{TrayAction, TrayIntegration};
 use crate::{
     extension::{
         EXTENSION_SCRIPT_NAME, ExtensionInput, ExtensionMetadata, InputKind, LiveExtensionHost,
@@ -52,7 +54,7 @@ pub fn run() -> eframe::Result<()> {
                 .with_min_inner_size([960.0, 620.0]),
             ..Default::default()
         },
-        Box::new(|_| Ok(Box::new(WireTermApp::new()))),
+        Box::new(|creation| Ok(Box::new(WireTermApp::new(creation)))),
     )
 }
 
@@ -104,6 +106,20 @@ struct Issue {
     detail: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowLifetimeIntent {
+    CloseRequest,
+    OpenFromTray,
+    QuitFromTray,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowLifetimeEffect {
+    Hide,
+    Restore,
+    Exit,
+}
+
 struct WireTermApp {
     host: HostBridge,
     devices: Vec<DeviceInfo>,
@@ -133,10 +149,13 @@ struct WireTermApp {
     host_status: String,
     issue: Option<Issue>,
     log: VecDeque<String>,
+    #[cfg(target_os = "windows")]
+    tray: Option<TrayIntegration>,
+    quit_requested: bool,
 }
 
 impl WireTermApp {
-    fn new() -> Self {
+    fn new(creation: &eframe::CreationContext<'_>) -> Self {
         let store = PlaylistStore::adjacent_to_executable()
             .unwrap_or_else(|_| PlaylistStore::new(Path::new("wireterm-data")));
         let (mut playlist, issue) = match store.load_or_initialize_default() {
@@ -162,6 +181,22 @@ impl WireTermApp {
             let _ = playback.poll(&playlist, Instant::now(), false);
             playback.pause();
         }
+        #[cfg(target_os = "windows")]
+        let (tray, tray_issue) = match TrayIntegration::new(&creation.egui_ctx) {
+            Ok(tray) => (Some(tray), None),
+            Err(error) => (
+                None,
+                Some(Issue {
+                    summary: "Tray icon could not be created".to_owned(),
+                    detail: format!(
+                        "{error}. Closing the WireTerm window will exit normally so the app cannot become inaccessible."
+                    ),
+                }),
+            ),
+        };
+        #[cfg(target_os = "windows")]
+        let issue = tray_issue.or(issue);
+
         Self {
             host: HostBridge::new(),
             devices: Vec::new(),
@@ -191,7 +226,61 @@ impl WireTermApp {
             host_status: "Looking for a display bridge…".to_owned(),
             issue,
             log: VecDeque::new(),
+            #[cfg(target_os = "windows")]
+            tray,
+            quit_requested: false,
         }
+    }
+
+    fn poll_window_lifetime(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        let actions = self
+            .tray
+            .as_ref()
+            .map_or_else(Vec::new, TrayIntegration::drain_actions);
+        #[cfg(target_os = "windows")]
+        for action in actions {
+            let intent = match action {
+                TrayAction::Open => WindowLifetimeIntent::OpenFromTray,
+                TrayAction::Quit => WindowLifetimeIntent::QuitFromTray,
+            };
+            let effect = window_lifetime_effect(intent, true, self.quit_requested);
+            self.apply_window_lifetime_effect(ctx, effect);
+        }
+
+        if ctx.input(|input| input.viewport().close_requested()) {
+            let effect = window_lifetime_effect(
+                WindowLifetimeIntent::CloseRequest,
+                self.tray_available(),
+                self.quit_requested,
+            );
+            self.apply_window_lifetime_effect(ctx, effect);
+        }
+    }
+
+    fn apply_window_lifetime_effect(&mut self, ctx: &egui::Context, effect: WindowLifetimeEffect) {
+        match effect {
+            WindowLifetimeEffect::Hide => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            WindowLifetimeEffect::Restore => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            WindowLifetimeEffect::Exit => {
+                self.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    const fn tray_available(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.tray.is_some();
+        #[cfg(not(target_os = "windows"))]
+        return false;
     }
 
     fn poll_render(&mut self, ctx: &egui::Context) {
@@ -1448,6 +1537,7 @@ impl WireTermApp {
 
 impl eframe::App for WireTermApp {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_window_lifetime(ctx);
         self.poll_extension_schema();
         self.ensure_selected_extension_schema();
         self.poll_render(ctx);
@@ -1606,6 +1696,22 @@ fn selection_preview_request(
     (previous_selection != Some(selected)).then_some(selected)
 }
 
+const fn window_lifetime_effect(
+    intent: WindowLifetimeIntent,
+    tray_available: bool,
+    quit_requested: bool,
+) -> WindowLifetimeEffect {
+    match intent {
+        WindowLifetimeIntent::CloseRequest if tray_available && !quit_requested => {
+            WindowLifetimeEffect::Hide
+        }
+        WindowLifetimeIntent::OpenFromTray => WindowLifetimeEffect::Restore,
+        WindowLifetimeIntent::CloseRequest | WindowLifetimeIntent::QuitFromTray => {
+            WindowLifetimeEffect::Exit
+        }
+    }
+}
+
 fn transfer_status(stage: &TransferStage) -> String {
     match stage {
         TransferStage::Connecting => "Connecting…".to_owned(),
@@ -1681,5 +1787,29 @@ mod tests {
         assert_eq!(selection_preview_request(None, first), Some(first));
         assert_eq!(selection_preview_request(Some(first), second), Some(second));
         assert_eq!(selection_preview_request(Some(second), second), None);
+    }
+
+    #[test]
+    fn window_lifetime_keeps_close_hide_recoverable_and_quit_explicit() {
+        assert_eq!(
+            window_lifetime_effect(WindowLifetimeIntent::CloseRequest, true, false),
+            WindowLifetimeEffect::Hide
+        );
+        assert_eq!(
+            window_lifetime_effect(WindowLifetimeIntent::CloseRequest, false, false),
+            WindowLifetimeEffect::Exit
+        );
+        assert_eq!(
+            window_lifetime_effect(WindowLifetimeIntent::OpenFromTray, true, false),
+            WindowLifetimeEffect::Restore
+        );
+        assert_eq!(
+            window_lifetime_effect(WindowLifetimeIntent::QuitFromTray, true, false),
+            WindowLifetimeEffect::Exit
+        );
+        assert_eq!(
+            window_lifetime_effect(WindowLifetimeIntent::CloseRequest, true, true),
+            WindowLifetimeEffect::Exit
+        );
     }
 }

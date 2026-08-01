@@ -4,9 +4,12 @@ WireTerm is a portable Windows 11 application for preparing and sending
 800 × 480 black/white/red frames to an offline ESP32 e-paper display bridge
 over USB serial.
 
-The application is one visible Playlist editor and player. It runs only while
-its foreground window is open and owns one active local Playlist. It does not
-install a tray process, background player, startup task, updater, or service.
+The application is one Playlist editor and player process with a Windows
+notification-area icon. Minimize keeps normal Windows taskbar behavior;
+closing the editor hides it while Playlist playback continues. Use **Open
+WireTerm** from the tray menu to restore the editor and **Quit WireTerm** to
+stop playback and exit completely. WireTerm does not install a separate tray
+process, second daemon, startup task, updater, or service.
 
 ## Run
 
@@ -36,11 +39,12 @@ revisions always win, so updating package files does not replace user edits.
 Image credits and the supplied-metadata caveat are in
 [`docs/default-playlist-attribution.md`](docs/default-playlist-attribution.md).
 
-To update manually, close WireTerm and replace `wireterm.exe` plus the shipped
+To update manually, choose **Quit WireTerm** from its tray menu and replace
+`wireterm.exe` plus the shipped
 documentation/font/example files while preserving `wireterm-data`. To remove
-WireTerm, close it and delete the extracted folder. There is no updater,
-registry entry, startup task, service, tray process, or OS-owned credential
-record to clean up.
+WireTerm, quit it and delete the extracted folder. There is no updater,
+registry entry, startup task, service, separately installed tray process, or
+OS-owned credential record to clean up.
 
 ## Playlist and playback
 
@@ -71,8 +75,9 @@ record to clean up.
 - `playlist` owns persisted revisions and built-in image/folder selection.
 - `playback` is a pure session state machine; it never owns serial transport.
 - `extension` owns the sandboxed Lua contract and pure-Rust SVG conversion.
-- `app` is the visible egui/eframe Playlist editor and bridge orchestrator.
-  Closing the window ends playback and the process.
+- `app` is the egui/eframe Playlist editor and bridge orchestrator. Hiding the
+  editor preserves the single process, Playlist session, and Host bridge;
+  explicit tray Quit ends them.
 
 ## Extensions
 
@@ -93,7 +98,7 @@ Response bodies are arbitrary bytes and capped at 5 MiB; request timeouts cap
 at 60 seconds, Lua execution caps at 30 seconds and 64 MiB, and returned SVG
 caps at 2 MiB. Secret values never enter Lua, the Playlist, the UI, or errors.
 
-The foreground app performs HTTP on its bounded render worker, defaults to
+The host app performs HTTP on its bounded render worker, defaults to
 denying redirects, and retains normal TLS certificate and hostname validation.
 MVP named-secret values are stored locally without encryption in adjacent
 immutable revisions and injected only at the final outgoing-header boundary.

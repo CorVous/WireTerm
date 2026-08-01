@@ -26,7 +26,11 @@ The first host interaction: choose one image file, prepare it as a frame, and se
 
 ## Host GUI
 
-The visible foreground Windows application for selecting an image, previewing the prepared frame, choosing a serial device, and observing transfer progress. Closing the window ends the host process.
+The Windows Playlist editor for selecting content, previewing prepared frames, choosing a serial device, and observing transfer progress. The editor may be hidden while its host process continues playback.
+
+## Tray host lifetime
+
+The lifetime in which one portable WireTerm process owns playback and the display bridge even while its editor is hidden. Explicit **Quit WireTerm** from the notification-area menu ends that process and playback.
 
 ## Focused sender layout
 

@@ -102,7 +102,7 @@ in WireTerm diagnostics. Protect access to the portable folder. Deleting it
 removes every WireTerm-owned secret artifact.
 
 `LocalFixtureHost` remains the deterministic unit-test implementation. The
-foreground app uses `LiveExtensionHost` on its render worker, keeping the egui
+host app uses `LiveExtensionHost` on its render worker, keeping the egui
 thread responsive. Closing the app cooperatively cancels Lua execution; any
 in-flight HTTP operation remains bounded by the shorter of its request timeout
 and the overall render deadline.
