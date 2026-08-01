@@ -21,8 +21,9 @@ use serde_json::Value;
 use crate::{
     extension::{
         EXTENSION_SCRIPT_NAME, ExtensionInput, ExtensionMetadata, InputKind, LiveExtensionHost,
-        LoadedExtension, RenderCancellation, discover_extensions, render_svg_to_panel,
-        scaffold_extension, system_fixture_clock, validate_extension_configuration,
+        LoadedExtension, RenderCancellation, discover_extensions, load_extension_schema,
+        render_svg_to_panel, scaffold_extension, system_fixture_clock,
+        validate_extension_configuration,
     },
     frame::{FRAME_HEIGHT, FRAME_WIDTH, PanelFrame},
     host::{HostBridge, HostEvent},
@@ -80,6 +81,16 @@ struct RenderTask {
     cancellation: RenderCancellation,
 }
 
+struct ExtensionSchemaResult {
+    item_id: ItemId,
+    result: Result<(ExtensionMetadata, Vec<ExtensionInput>), String>,
+}
+
+struct ExtensionSchemaTask {
+    item_id: ItemId,
+    receiver: Receiver<ExtensionSchemaResult>,
+}
+
 struct PendingTransfer {
     label: String,
     frame: Arc<PanelFrame>,
@@ -106,6 +117,8 @@ struct WireTermApp {
     dragged_item: Option<ItemId>,
     interval_edits: HashMap<ItemId, String>,
     extension_schemas: HashMap<ItemId, (ExtensionMetadata, Vec<ExtensionInput>)>,
+    extension_schema_errors: HashMap<ItemId, String>,
+    extension_schema_task: Option<ExtensionSchemaTask>,
     playback: PlaybackController,
     shuffle_bags: FolderShuffleBags,
     render_task: Option<RenderTask>,
@@ -160,6 +173,8 @@ impl WireTermApp {
             dragged_item: None,
             interval_edits: HashMap::new(),
             extension_schemas: HashMap::new(),
+            extension_schema_errors: HashMap::new(),
+            extension_schema_task: None,
             playback,
             shuffle_bags: FolderShuffleBags::default(),
             render_task: None,
@@ -180,6 +195,7 @@ impl WireTermApp {
             Ok(rendered) => {
                 if let Some(schema) = rendered.schema {
                     self.extension_schemas.insert(rendered.item_id, schema);
+                    self.extension_schema_errors.remove(&rendered.item_id);
                 }
                 match rendered.result {
                     Ok(frame) => match rendered.purpose {
@@ -208,6 +224,72 @@ impl WireTermApp {
                 self.playback.failed(&self.playlist, Instant::now(), false);
             }
         }
+    }
+
+    fn poll_extension_schema(&mut self) {
+        let Some(task) = self.extension_schema_task.take() else {
+            return;
+        };
+        match task.receiver.try_recv() {
+            Ok(ExtensionSchemaResult { item_id, result }) => match result {
+                Ok(schema) => {
+                    self.extension_schemas.insert(item_id, schema);
+                    self.extension_schema_errors.remove(&item_id);
+                }
+                Err(error) => {
+                    self.extension_schema_errors.insert(item_id, error.clone());
+                    self.record_issue("Extension inputs could not be loaded", error);
+                }
+            },
+            Err(TryRecvError::Empty) => self.extension_schema_task = Some(task),
+            Err(TryRecvError::Disconnected) => {
+                let error = "The Extension input loader stopped unexpectedly".to_owned();
+                self.extension_schema_errors
+                    .insert(task.item_id, error.clone());
+                self.record_issue("Extension inputs could not be loaded", error);
+            }
+        }
+    }
+
+    fn ensure_selected_extension_schema(&mut self) {
+        let Some(item_id) = self.selected_item else {
+            return;
+        };
+        if self.extension_schemas.contains_key(&item_id)
+            || self.extension_schema_errors.contains_key(&item_id)
+            || self.extension_schema_task.is_some()
+        {
+            return;
+        }
+        let Some(PlaylistSource::Extension { path, .. }) =
+            self.playlist.item(item_id).map(|item| &item.source)
+        else {
+            return;
+        };
+        let script_path = extension_script_path(&self.store.resolve_source_path(path));
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("wireterm-extension-inputs".to_owned())
+            .spawn(move || {
+                let result = load_extension_schema(&script_path).map_err(|error| error.to_string());
+                let _ = sender.send(ExtensionSchemaResult { item_id, result });
+            }) {
+            Ok(_) => {
+                self.extension_schema_task = Some(ExtensionSchemaTask { item_id, receiver });
+            }
+            Err(error) => {
+                let error = format!("Could not start the Extension input loader: {error}");
+                self.extension_schema_errors.insert(item_id, error.clone());
+                self.record_issue("Extension inputs could not be loaded", error);
+            }
+        }
+    }
+
+    fn select_item(&mut self, item_id: ItemId) {
+        if self.selected_item != Some(item_id) {
+            self.extension_schema_errors.remove(&item_id);
+        }
+        self.selected_item = Some(item_id);
     }
 
     fn poll_host(&mut self, ctx: &egui::Context) {
@@ -415,7 +497,7 @@ impl WireTermApp {
         let id = self
             .playlist
             .add_item(title, PlaylistSource::Image { path });
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
     }
 
@@ -427,7 +509,7 @@ impl WireTermApp {
         let id = self
             .playlist
             .add_item(title, PlaylistSource::ImageFolder { path });
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
     }
 
@@ -453,7 +535,7 @@ impl WireTermApp {
                 named_secret_refs: BTreeMap::new(),
             },
         );
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
         self.extension_library_open = false;
     }
@@ -465,6 +547,14 @@ impl WireTermApp {
         self.playlist.items.retain(|item| item.id != id);
         self.interval_edits.remove(&id);
         self.extension_schemas.remove(&id);
+        self.extension_schema_errors.remove(&id);
+        if self
+            .extension_schema_task
+            .as_ref()
+            .is_some_and(|task| task.item_id == id)
+        {
+            self.extension_schema_task = None;
+        }
         self.selected_item = self.playlist.items.first().map(|item| item.id);
         self.save_playlist();
     }
@@ -616,7 +706,7 @@ impl WireTermApp {
                                 number_clicked = number_response.clicked();
                             });
                             if number_clicked {
-                                self.selected_item = Some(item.id);
+                                self.select_item(item.id);
                             }
                             if ui
                                 .selectable_label(
@@ -625,7 +715,7 @@ impl WireTermApp {
                                 )
                                 .clicked()
                             {
-                                self.selected_item = Some(item.id);
+                                self.select_item(item.id);
                             }
                             ui.label(item.source.kind_name());
                             ui.label(format!(
@@ -909,9 +999,14 @@ impl WireTermApp {
                 Some(PlaylistSource::Extension { .. })
             ) {
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Refresh preview to load this Extension’s inputs.").color(MUTED),
-                );
+                if let Some(error) = self.extension_schema_errors.get(&id) {
+                    ui.label(
+                        RichText::new(format!("Extension inputs could not be loaded: {error}"))
+                            .color(ACCENT),
+                    );
+                } else {
+                    ui.label(RichText::new("Loading Extension inputs…").color(MUTED));
+                }
             }
             return;
         };
@@ -1276,10 +1371,13 @@ impl WireTermApp {
 
 impl eframe::App for WireTermApp {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_extension_schema();
+        self.ensure_selected_extension_schema();
         self.poll_render(ctx);
         self.poll_host(ctx);
         self.poll_playback();
-        if self.render_task.is_some()
+        if self.extension_schema_task.is_some()
+            || self.render_task.is_some()
             || self.host.is_transfer_active()
             || self.playback.is_running()
         {

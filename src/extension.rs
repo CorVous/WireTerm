@@ -106,6 +106,8 @@ pub enum HostApiError {
     InvalidHttp,
     #[error("HTTP request failed")]
     Http,
+    #[error("host capability is unavailable while loading Extension inputs")]
+    SchemaLoad,
     #[error("HTTP request timed out")]
     Timeout,
     #[error("Extension render was cancelled")]
@@ -148,6 +150,27 @@ pub trait ExtensionHostApi: Send + Sync {
     fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError>;
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+struct SchemaExtensionHost {
+    extension_root: PathBuf,
+}
+
+impl ExtensionHostApi for SchemaExtensionHost {
+    fn http(&self, _: HostHttpRequest) -> Result<HostHttpResponse, HostApiError> {
+        Err(HostApiError::SchemaLoad)
+    }
+
+    fn clock(&self) -> HostClock {
+        HostClock {
+            unix_seconds: 0,
+            utc_offset_minutes: 0,
+        }
+    }
+
+    fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError> {
+        contained_asset(&self.extension_root, relative_path)
     }
 }
 
@@ -553,6 +576,19 @@ impl LoadedExtension {
             .map(str::to_owned)
             .map_err(|_| ExtensionError::SvgNotUtf8)
     }
+}
+
+/// Load and validate an Extension's declared metadata and inputs without
+/// calling its renderer or granting live HTTP access.
+pub fn load_extension_schema(
+    script_path: &Path,
+) -> Result<(ExtensionMetadata, Vec<ExtensionInput>), ExtensionError> {
+    let extension_root = script_path.parent().ok_or(ExtensionError::ReadScript)?;
+    let host = Arc::new(SchemaExtensionHost {
+        extension_root: extension_root.to_path_buf(),
+    });
+    let extension = LoadedExtension::load(script_path, host)?;
+    Ok((extension.metadata, extension.inputs))
 }
 
 fn validate_metadata(metadata: &ExtensionMetadata) -> Result<(), ExtensionError> {
@@ -1177,6 +1213,61 @@ mod tests {
             let _ = requests_sender.send(requests);
         });
         (requests_receiver, handle)
+    }
+
+    #[test]
+    fn schema_loader_returns_every_declared_field_without_calling_render() {
+        let fixture = TestExtension::new();
+        let script = r#"
+            return {
+              metadata = { id = "schema-demo", name = "Schema demo", version = 1 },
+              inputs = {
+                { key = "title", label = "Title", kind = "text", required = true, default = "Hello" },
+                { key = "count", label = "Count", kind = "number", required = false, default = 3 },
+                { key = "enabled", label = "Enabled", kind = "checkbox", required = false, default = true },
+                { key = "style", label = "Style", kind = "choice", required = true, default = "plain", choices = { "plain", "bold" } },
+                { key = "token", label = "Token", kind = "named_secret", required = true },
+              },
+              render = function()
+                error("schema loading must not call render")
+              end,
+            }
+        "#;
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, script).expect("schema script");
+
+        let (metadata, inputs) = load_extension_schema(&script_path).expect("load inputs");
+
+        assert_eq!(metadata.id, "schema-demo");
+        assert_eq!(inputs.len(), 5);
+        assert_eq!(inputs[0].kind, InputKind::Text);
+        assert_eq!(inputs[1].kind, InputKind::Number);
+        assert_eq!(inputs[2].kind, InputKind::Checkbox);
+        assert_eq!(inputs[3].kind, InputKind::Choice);
+        assert_eq!(inputs[4].kind, InputKind::NamedSecret);
+    }
+
+    #[test]
+    fn schema_loader_does_not_grant_top_level_http_access() {
+        let fixture = TestExtension::new();
+        let script = r#"
+            wireterm.http({ method = "GET", url = "https://example.invalid" })
+            return {
+              metadata = { id = "unsafe-schema", name = "Unsafe schema", version = 1 },
+              inputs = {},
+              render = function() return "<svg/>" end,
+            }
+        "#;
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, script).expect("schema script");
+
+        let error = load_extension_schema(&script_path).expect_err("HTTP must be unavailable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("host capability is unavailable while loading Extension inputs")
+        );
     }
 
     #[test]
