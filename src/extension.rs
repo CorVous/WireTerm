@@ -106,6 +106,8 @@ pub enum HostApiError {
     InvalidHttp,
     #[error("HTTP request failed")]
     Http,
+    #[error("host capability is unavailable while loading Extension inputs")]
+    SchemaLoad,
     #[error("HTTP request timed out")]
     Timeout,
     #[error("Extension render was cancelled")]
@@ -148,6 +150,27 @@ pub trait ExtensionHostApi: Send + Sync {
     fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError>;
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+struct SchemaExtensionHost {
+    extension_root: PathBuf,
+}
+
+impl ExtensionHostApi for SchemaExtensionHost {
+    fn http(&self, _: HostHttpRequest) -> Result<HostHttpResponse, HostApiError> {
+        Err(HostApiError::SchemaLoad)
+    }
+
+    fn clock(&self) -> HostClock {
+        HostClock {
+            unix_seconds: 0,
+            utc_offset_minutes: 0,
+        }
+    }
+
+    fn asset(&self, relative_path: &Path) -> Result<PathBuf, HostApiError> {
+        contained_asset(&self.extension_root, relative_path)
     }
 }
 
@@ -553,6 +576,19 @@ impl LoadedExtension {
             .map(str::to_owned)
             .map_err(|_| ExtensionError::SvgNotUtf8)
     }
+}
+
+/// Load and validate an Extension's declared metadata and inputs without
+/// calling its renderer or granting live HTTP access.
+pub fn load_extension_schema(
+    script_path: &Path,
+) -> Result<(ExtensionMetadata, Vec<ExtensionInput>), ExtensionError> {
+    let extension_root = script_path.parent().ok_or(ExtensionError::ReadScript)?;
+    let host = Arc::new(SchemaExtensionHost {
+        extension_root: extension_root.to_path_buf(),
+    });
+    let extension = LoadedExtension::load(script_path, host)?;
+    Ok((extension.metadata, extension.inputs))
 }
 
 fn validate_metadata(metadata: &ExtensionMetadata) -> Result<(), ExtensionError> {
@@ -1084,6 +1120,9 @@ mod tests {
 
     use super::*;
 
+    const GITHUB_OPEN_PRS_LUA: &str =
+        include_str!("../examples/extensions/github-open-prs/extension.lua");
+
     struct TestExtension(PathBuf);
 
     impl TestExtension {
@@ -1174,6 +1213,61 @@ mod tests {
             let _ = requests_sender.send(requests);
         });
         (requests_receiver, handle)
+    }
+
+    #[test]
+    fn schema_loader_returns_every_declared_field_without_calling_render() {
+        let fixture = TestExtension::new();
+        let script = r#"
+            return {
+              metadata = { id = "schema-demo", name = "Schema demo", version = 1 },
+              inputs = {
+                { key = "title", label = "Title", kind = "text", required = true, default = "Hello" },
+                { key = "count", label = "Count", kind = "number", required = false, default = 3 },
+                { key = "enabled", label = "Enabled", kind = "checkbox", required = false, default = true },
+                { key = "style", label = "Style", kind = "choice", required = true, default = "plain", choices = { "plain", "bold" } },
+                { key = "token", label = "Token", kind = "named_secret", required = true },
+              },
+              render = function()
+                error("schema loading must not call render")
+              end,
+            }
+        "#;
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, script).expect("schema script");
+
+        let (metadata, inputs) = load_extension_schema(&script_path).expect("load inputs");
+
+        assert_eq!(metadata.id, "schema-demo");
+        assert_eq!(inputs.len(), 5);
+        assert_eq!(inputs[0].kind, InputKind::Text);
+        assert_eq!(inputs[1].kind, InputKind::Number);
+        assert_eq!(inputs[2].kind, InputKind::Checkbox);
+        assert_eq!(inputs[3].kind, InputKind::Choice);
+        assert_eq!(inputs[4].kind, InputKind::NamedSecret);
+    }
+
+    #[test]
+    fn schema_loader_does_not_grant_top_level_http_access() {
+        let fixture = TestExtension::new();
+        let script = r#"
+            wireterm.http({ method = "GET", url = "https://example.invalid" })
+            return {
+              metadata = { id = "unsafe-schema", name = "Unsafe schema", version = 1 },
+              inputs = {},
+              render = function() return "<svg/>" end,
+            }
+        "#;
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, script).expect("schema script");
+
+        let error = load_extension_schema(&script_path).expect_err("HTTP must be unavailable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("host capability is unavailable while loading Extension inputs")
+        );
     }
 
     #[test]
@@ -1502,6 +1596,158 @@ mod tests {
                 .chunks_exact(3)
                 .any(|pixel| pixel == PanelColor::Black.rgb())
         );
+    }
+
+    #[test]
+    fn github_open_prs_example_renders_deterministic_fixture_without_secret_leakage() {
+        let fixture = TestExtension::new();
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
+        let url = "https://api.github.com/search/issues?q=type%3Apr%20state%3Aopen%20author%3ACorVous&sort=updated&order=desc&per_page=5";
+        let response = br#"{
+          "total_count": 7,
+          "incomplete_results": false,
+          "items": [
+            {
+              "number": 42,
+              "title": "Fix <parser> & \"quotes\" \ud83d\ude80",
+              "updated_at": "2026-07-30T12:00:00Z",
+              "repository_url": "https://api.github.com/repos/example/private-repo"
+            },
+            {
+              "number": 7,
+              "title": null,
+              "updated_at": null,
+              "repository_url": null
+            }
+          ]
+        }"#;
+        let secret_name = "fixture-github-authorization";
+        let secret_refs = BTreeMap::from([("github_token".to_owned(), secret_name.to_owned())]);
+        let host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs.clone(),
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 200,
+                    headers: BTreeMap::from([("x-ratelimit-remaining".to_owned(), b"29".to_vec())]),
+                    body: response.to_vec(),
+                },
+            ),
+        );
+        let extension =
+            LoadedExtension::load(&script_path, host.clone()).expect("load GitHub example");
+        let settings =
+            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
+        let resolved = validate_extension_configuration(
+            &extension.inputs,
+            &settings,
+            &secret_refs,
+            &[secret_name.to_owned()],
+        )
+        .expect("valid GitHub example settings");
+        let svg = extension.render_svg(&resolved).expect("GitHub fixture SVG");
+
+        assert!(svg.contains("example/private-repo"));
+        assert!(svg.contains("#42"));
+        assert!(svg.contains("Fix &lt;parser&gt; &amp; &quot;quotes&quot; 🚀"));
+        assert!(svg.contains("(untitled pull request)"));
+        assert!(!svg.contains(secret_name));
+        assert!(!resolved.contains_key("github_token"));
+        let frame = render_svg_to_panel(&svg, &fixture.0).expect("GitHub fixture frame");
+        assert_eq!(frame.payload().len(), crate::frame::FRAME_BYTES);
+
+        let requests = host.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, url);
+        assert_eq!(request.headers["Accept"], "application/vnd.github+json");
+        assert_eq!(request.headers["X-GitHub-Api-Version"], "2022-11-28");
+        assert_eq!(
+            request.headers["User-Agent"],
+            "WireTerm-GitHub-Open-PRs/1.0"
+        );
+        assert_eq!(request.secret_headers["Authorization"], secret_name);
+        assert!(!request.url.contains(secret_name));
+    }
+
+    #[test]
+    fn github_open_prs_example_handles_empty_and_rate_limited_responses() {
+        let fixture = TestExtension::new();
+        let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
+        fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
+        let url = "https://api.github.com/search/issues?q=type%3Apr%20state%3Aopen%20author%3ACorVous&sort=updated&order=desc&per_page=5";
+        let secret_refs = BTreeMap::from([(
+            "github_token".to_owned(),
+            "fixture-github-authorization".to_owned(),
+        )]);
+        let settings =
+            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
+
+        let empty_host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs.clone(),
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: br#"{"total_count":0,"incomplete_results":false,"items":[]}"#.to_vec(),
+                },
+            ),
+        );
+        let empty_extension =
+            LoadedExtension::load(&script_path, empty_host).expect("load empty example");
+        let empty_svg = empty_extension
+            .render_svg(&settings)
+            .expect("empty GitHub SVG");
+        assert!(empty_svg.contains("No open pull requests"));
+        render_svg_to_panel(&empty_svg, &fixture.0).expect("empty GitHub frame");
+
+        let rate_host = Arc::new(
+            LocalFixtureHost::new(
+                fixture.0.clone(),
+                secret_refs,
+                HostClock {
+                    unix_seconds: 1_785_484_800,
+                    utc_offset_minutes: 0,
+                },
+            )
+            .with_response(
+                "GET",
+                url,
+                HostHttpResponse {
+                    status: 403,
+                    headers: BTreeMap::from([("x-ratelimit-remaining".to_owned(), b"0".to_vec())]),
+                    body: br#"{"message":"must-not-appear"}"#.to_vec(),
+                },
+            ),
+        );
+        let rate_extension =
+            LoadedExtension::load(&script_path, rate_host).expect("load rate-limit example");
+        let error = rate_extension
+            .render_svg(&settings)
+            .expect_err("rate limit must fail safely")
+            .to_string();
+        assert!(error.contains("rate limit"));
+        assert!(!error.contains("must-not-appear"));
+        assert!(!error.contains("api.github.com"));
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub const PLAYLIST_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_INTERVAL_MINUTES: u16 = 15;
 pub const MIN_INTERVAL_MINUTES: u16 = 1;
 pub const MAX_INTERVAL_MINUTES: u16 = 1_440;
+pub const DEFAULT_PLAYLIST_TEMPLATE_NAME: &str = "default-playlist.json";
+pub const DEFAULT_PLAYLIST_IMAGE_FOLDER: &str = "images/default-playlist";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -273,6 +275,10 @@ pub enum PlaylistError {
     Encode(#[from] serde_json::Error),
     #[error("could not locate the WireTerm executable")]
     ExecutablePath,
+    #[error("default Playlist source paths must be relative to adjacent WireTerm data: {0}")]
+    NonPortableDefaultSource(PathBuf),
+    #[error("default Playlist source is unavailable: {0}")]
+    DefaultSource(#[source] SourceError),
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +312,77 @@ impl PlaylistStore {
         &self.revisions_dir
     }
 
+    #[must_use]
+    pub fn resolve_source_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.data_dir.join(path)
+        }
+    }
+
+    /// Load an existing immutable revision or create revision 1 from the
+    /// adjacent portable template when no revision has ever been saved.
+    pub fn load_or_initialize_default(&self) -> Result<PlaylistRevision, PlaylistError> {
+        if self.has_revision_files()? {
+            return self.load_latest();
+        }
+        let template_path = self.data_dir.join(DEFAULT_PLAYLIST_TEMPLATE_NAME);
+        let bytes = match fs::read(&template_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(PlaylistRevision::default());
+            }
+            Err(source) => {
+                return Err(PlaylistError::Io {
+                    path: template_path,
+                    source,
+                });
+            }
+        };
+        let template = serde_json::from_slice::<PlaylistRevision>(&bytes).map_err(|source| {
+            PlaylistError::Decode {
+                path: template_path,
+                source,
+            }
+        })?;
+        template.validate()?;
+        for item in &template.items {
+            let path = item.source.display_path();
+            if !is_safe_relative_asset_path(path) {
+                return Err(PlaylistError::NonPortableDefaultSource(path.to_path_buf()));
+            }
+            if let PlaylistSource::ImageFolder { path } = &item.source {
+                let resolved = self.resolve_source_path(path);
+                if scan_image_folder(&resolved)
+                    .map_err(PlaylistError::DefaultSource)?
+                    .is_empty()
+                {
+                    return Err(PlaylistError::DefaultSource(SourceError::EmptyFolder(
+                        resolved,
+                    )));
+                }
+            }
+        }
+        self.save_new_revision(template)
+    }
+
+    fn has_revision_files(&self) -> Result<bool, PlaylistError> {
+        let entries = match fs::read_dir(&self.revisions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(PlaylistError::Io {
+                    path: self.revisions_dir.clone(),
+                    source,
+                });
+            }
+        };
+        Ok(entries
+            .filter_map(Result::ok)
+            .any(|entry| is_revision_path(&entry.path())))
+    }
+
     pub fn load_latest(&self) -> Result<PlaylistRevision, PlaylistError> {
         let entries = match fs::read_dir(&self.revisions_dir) {
             Ok(entries) => entries,
@@ -322,16 +399,7 @@ impl PlaylistStore {
         let mut candidates = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("revision-")
-                            && Path::new(name)
-                                .extension()
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-                    })
-            })
+            .filter(|path| is_revision_path(path))
             .collect::<Vec<_>>();
         candidates.sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
 
@@ -397,6 +465,17 @@ impl PlaylistStore {
         write_result?;
         Ok(revision)
     }
+}
+
+fn is_revision_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("revision-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
 }
 
 fn write_revision_file(path: &Path, bytes: &[u8]) -> Result<(), PlaylistError> {
@@ -624,6 +703,145 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn write_default_template(data_dir: &Path, source_path: &str) {
+        let mut template = PlaylistRevision::default();
+        template.add_item(
+            "Red image collection".to_owned(),
+            PlaylistSource::ImageFolder {
+                path: source_path.into(),
+            },
+        );
+        fs::write(
+            data_dir.join(DEFAULT_PLAYLIST_TEMPLATE_NAME),
+            serde_json::to_vec_pretty(&template).expect("encode template"),
+        )
+        .expect("write template");
+    }
+
+    #[test]
+    fn fresh_data_initializes_portable_default_once() {
+        let directory = TestDirectory::new("default-init");
+        let image_folder = directory.0.join(DEFAULT_PLAYLIST_IMAGE_FOLDER);
+        fs::create_dir_all(&image_folder).expect("image folder");
+        File::create(image_folder.join("red.jpg")).expect("image fixture");
+        write_default_template(&directory.0, DEFAULT_PLAYLIST_IMAGE_FOLDER);
+        let store = PlaylistStore::new(&directory.0);
+
+        let initialized = store
+            .load_or_initialize_default()
+            .expect("initialize default");
+        let initialized_again = store
+            .load_or_initialize_default()
+            .expect("load initialized default");
+
+        assert_eq!(initialized.revision, 1);
+        assert_eq!(initialized_again, initialized);
+        assert_eq!(initialized.default_interval_minutes, 15);
+        assert_eq!(initialized.items.len(), 1);
+        assert!(initialized.items[0].enabled);
+        assert_eq!(initialized.items[0].interval_minutes, None);
+        assert_eq!(
+            initialized.items[0].source,
+            PlaylistSource::ImageFolder {
+                path: PathBuf::from(DEFAULT_PLAYLIST_IMAGE_FOLDER)
+            }
+        );
+        assert_eq!(
+            store.resolve_source_path(initialized.items[0].source.display_path()),
+            image_folder
+        );
+        assert_eq!(
+            fs::read_dir(store.revisions_dir())
+                .expect("revision directory")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn existing_revision_is_preserved_when_default_template_changes() {
+        let directory = TestDirectory::new("default-preserve");
+        let store = PlaylistStore::new(&directory.0);
+        let mut existing = PlaylistRevision::default();
+        let existing_id = existing.add_item(
+            "Existing user item".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("C:\\user\\chosen.png"),
+            },
+        );
+        let existing = store
+            .save_new_revision(existing)
+            .expect("existing revision");
+        write_default_template(&directory.0, "images/missing-default");
+
+        let loaded = store
+            .load_or_initialize_default()
+            .expect("load existing revision");
+
+        assert_eq!(loaded, existing);
+        assert_eq!(
+            loaded.item(existing_id).expect("existing item").title,
+            "Existing user item"
+        );
+        assert_eq!(
+            fs::read_dir(store.revisions_dir())
+                .expect("revision directory")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn default_template_rejects_nonportable_or_ineligible_folders() {
+        let nonportable = TestDirectory::new("default-nonportable");
+        write_default_template(&nonportable.0, "../outside");
+        assert!(matches!(
+            PlaylistStore::new(&nonportable.0).load_or_initialize_default(),
+            Err(PlaylistError::NonPortableDefaultSource(_))
+        ));
+        assert!(!PlaylistStore::new(&nonportable.0).revisions_dir().exists());
+
+        let empty = TestDirectory::new("default-empty");
+        fs::create_dir_all(empty.0.join(DEFAULT_PLAYLIST_IMAGE_FOLDER).join("nested"))
+            .expect("nested folder");
+        File::create(
+            empty
+                .0
+                .join(DEFAULT_PLAYLIST_IMAGE_FOLDER)
+                .join("nested")
+                .join("not-direct.jpg"),
+        )
+        .expect("nested fixture");
+        write_default_template(&empty.0, DEFAULT_PLAYLIST_IMAGE_FOLDER);
+        assert!(matches!(
+            PlaylistStore::new(&empty.0).load_or_initialize_default(),
+            Err(PlaylistError::DefaultSource(SourceError::EmptyFolder(_)))
+        ));
+        assert!(!PlaylistStore::new(&empty.0).revisions_dir().exists());
+    }
+
+    #[test]
+    fn bundled_default_folder_is_exact_and_fully_decodable() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/default-playlist");
+        let images = scan_image_folder(&folder).expect("scan bundled images");
+        assert_eq!(images.len(), 16);
+        assert_eq!(
+            fs::read_dir(&folder).expect("read bundled folder").count(),
+            images.len(),
+            "the non-recursive folder must contain playlist JPEGs only"
+        );
+        for path in images {
+            assert_eq!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("jpg")
+            );
+            assert_eq!(
+                image::image_dimensions(&path).expect("decode image"),
+                (800, 480)
+            );
+        }
     }
 
     #[test]

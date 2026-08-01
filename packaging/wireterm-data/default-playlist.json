@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "revision": 0,
+  "default_interval_minutes": 15,
+  "next_item_id": 2,
+  "items": [
+    {
+      "id": 1,
+      "title": "Red image collection",
+      "enabled": true,
+      "source": {
+        "type": "image_folder",
+        "path": "images/default-playlist"
+      }
+    }
+  ]
+}

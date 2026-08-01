@@ -21,8 +21,9 @@ use serde_json::Value;
 use crate::{
     extension::{
         EXTENSION_SCRIPT_NAME, ExtensionInput, ExtensionMetadata, InputKind, LiveExtensionHost,
-        LoadedExtension, RenderCancellation, discover_extensions, render_svg_to_panel,
-        scaffold_extension, system_fixture_clock, validate_extension_configuration,
+        LoadedExtension, RenderCancellation, discover_extensions, load_extension_schema,
+        render_svg_to_panel, scaffold_extension, system_fixture_clock,
+        validate_extension_configuration,
     },
     frame::{FRAME_HEIGHT, FRAME_WIDTH, PanelFrame},
     host::{HostBridge, HostEvent},
@@ -40,6 +41,7 @@ use zeroize::{Zeroize, Zeroizing};
 const ACCENT: Color32 = Color32::from_rgb(232, 92, 70);
 const MUTED: Color32 = Color32::from_rgb(145, 151, 164);
 const PANEL_2: Color32 = Color32::from_rgb(42, 45, 52);
+const DEVICE_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 pub fn run() -> eframe::Result<()> {
     eframe::run_native(
@@ -55,6 +57,7 @@ pub fn run() -> eframe::Result<()> {
 }
 
 struct PreparedPreview {
+    item_id: ItemId,
     frame: Arc<PanelFrame>,
     texture: egui::TextureHandle,
     label: String,
@@ -80,7 +83,18 @@ struct RenderTask {
     cancellation: RenderCancellation,
 }
 
+struct ExtensionSchemaResult {
+    item_id: ItemId,
+    result: Result<(ExtensionMetadata, Vec<ExtensionInput>), String>,
+}
+
+struct ExtensionSchemaTask {
+    item_id: ItemId,
+    receiver: Receiver<ExtensionSchemaResult>,
+}
+
 struct PendingTransfer {
+    item_id: ItemId,
     label: String,
     frame: Arc<PanelFrame>,
 }
@@ -94,6 +108,7 @@ struct WireTermApp {
     host: HostBridge,
     devices: Vec<DeviceInfo>,
     selected_port: Option<String>,
+    next_device_discovery_at: Instant,
     store: PlaylistStore,
     secret_store: SecretStore,
     secret_names: Vec<String>,
@@ -106,6 +121,8 @@ struct WireTermApp {
     dragged_item: Option<ItemId>,
     interval_edits: HashMap<ItemId, String>,
     extension_schemas: HashMap<ItemId, (ExtensionMetadata, Vec<ExtensionInput>)>,
+    extension_schema_errors: HashMap<ItemId, String>,
+    extension_schema_task: Option<ExtensionSchemaTask>,
     playback: PlaybackController,
     shuffle_bags: FolderShuffleBags,
     render_task: Option<RenderTask>,
@@ -121,7 +138,7 @@ impl WireTermApp {
     fn new() -> Self {
         let store = PlaylistStore::adjacent_to_executable()
             .unwrap_or_else(|_| PlaylistStore::new(Path::new("wireterm-data")));
-        let (mut playlist, issue) = match store.load_latest() {
+        let (mut playlist, issue) = match store.load_or_initialize_default() {
             Ok(playlist) => (playlist, None),
             Err(error) => (
                 PlaylistRevision::default(),
@@ -148,6 +165,7 @@ impl WireTermApp {
             host: HostBridge::new(),
             devices: Vec::new(),
             selected_port: None,
+            next_device_discovery_at: Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL,
             store,
             secret_store,
             secret_names,
@@ -160,6 +178,8 @@ impl WireTermApp {
             dragged_item: None,
             interval_edits: HashMap::new(),
             extension_schemas: HashMap::new(),
+            extension_schema_errors: HashMap::new(),
+            extension_schema_task: None,
             playback,
             shuffle_bags: FolderShuffleBags::default(),
             render_task: None,
@@ -180,15 +200,18 @@ impl WireTermApp {
             Ok(rendered) => {
                 if let Some(schema) = rendered.schema {
                     self.extension_schemas.insert(rendered.item_id, schema);
+                    self.extension_schema_errors.remove(&rendered.item_id);
                 }
                 match rendered.result {
                     Ok(frame) => match rendered.purpose {
                         RenderPurpose::Preview => {
-                            self.set_preview(ctx, frame, rendered.label);
+                            if preview_matches_selection(self.selected_item, rendered.item_id) {
+                                self.set_preview(ctx, rendered.item_id, frame, rendered.label);
+                            }
                         }
                         RenderPurpose::Playback => {
                             self.playback.rendered();
-                            self.begin_transfer(frame, rendered.label);
+                            self.begin_transfer(rendered.item_id, frame, rendered.label);
                         }
                     },
                     Err(error) => {
@@ -210,20 +233,106 @@ impl WireTermApp {
         }
     }
 
+    fn poll_extension_schema(&mut self) {
+        let Some(task) = self.extension_schema_task.take() else {
+            return;
+        };
+        match task.receiver.try_recv() {
+            Ok(ExtensionSchemaResult { item_id, result }) => match result {
+                Ok(schema) => {
+                    self.extension_schemas.insert(item_id, schema);
+                    self.extension_schema_errors.remove(&item_id);
+                }
+                Err(error) => {
+                    self.extension_schema_errors.insert(item_id, error.clone());
+                    self.record_issue("Extension inputs could not be loaded", error);
+                }
+            },
+            Err(TryRecvError::Empty) => self.extension_schema_task = Some(task),
+            Err(TryRecvError::Disconnected) => {
+                let error = "The Extension input loader stopped unexpectedly".to_owned();
+                self.extension_schema_errors
+                    .insert(task.item_id, error.clone());
+                self.record_issue("Extension inputs could not be loaded", error);
+            }
+        }
+    }
+
+    fn ensure_selected_extension_schema(&mut self) {
+        let Some(item_id) = self.selected_item else {
+            return;
+        };
+        if self.extension_schemas.contains_key(&item_id)
+            || self.extension_schema_errors.contains_key(&item_id)
+            || self.extension_schema_task.is_some()
+        {
+            return;
+        }
+        let Some(PlaylistSource::Extension { path, .. }) =
+            self.playlist.item(item_id).map(|item| &item.source)
+        else {
+            return;
+        };
+        let script_path = extension_script_path(&self.store.resolve_source_path(path));
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("wireterm-extension-inputs".to_owned())
+            .spawn(move || {
+                let result = load_extension_schema(&script_path).map_err(|error| error.to_string());
+                let _ = sender.send(ExtensionSchemaResult { item_id, result });
+            }) {
+            Ok(_) => {
+                self.extension_schema_task = Some(ExtensionSchemaTask { item_id, receiver });
+            }
+            Err(error) => {
+                let error = format!("Could not start the Extension input loader: {error}");
+                self.extension_schema_errors.insert(item_id, error.clone());
+                self.record_issue("Extension inputs could not be loaded", error);
+            }
+        }
+    }
+
+    fn select_item(&mut self, item_id: ItemId) {
+        if self.selected_item != Some(item_id) {
+            self.extension_schema_errors.remove(&item_id);
+            if self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.item_id != item_id)
+            {
+                self.preview = None;
+            }
+        }
+        self.selected_item = Some(item_id);
+    }
+
     fn poll_host(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.host.try_recv() {
             match event {
-                HostEvent::DevicesChanged(devices) => self.update_devices(devices),
+                HostEvent::DevicesChanged(devices) => {
+                    self.update_devices(devices);
+                    self.next_device_discovery_at =
+                        Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL;
+                }
                 HostEvent::DeviceDiscoveryFailed(error) => {
                     "Device scan failed".clone_into(&mut self.host_status);
                     self.record_issue("Display bridge scan failed", error);
+                    self.next_device_discovery_at =
+                        Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL;
                 }
                 HostEvent::TransferProgress(stage) => {
                     self.transfer_progress = stage.progress();
                     self.host_status = transfer_status(&stage);
                     if stage == TransferStage::Complete {
                         if let Some(transfer) = self.pending_transfer.take() {
-                            self.set_preview(ctx, (*transfer.frame).clone(), transfer.label);
+                            if preview_matches_selection(self.selected_item, transfer.item_id) {
+                                self.set_preview(
+                                    ctx,
+                                    transfer.item_id,
+                                    (*transfer.frame).clone(),
+                                    transfer.label,
+                                );
+                            }
                             self.playback.send_succeeded();
                         }
                         let _ = self.host.refresh_devices();
@@ -243,6 +352,18 @@ impl WireTermApp {
                 }
             }
         }
+    }
+
+    fn poll_device_discovery(&mut self, ctx: &egui::Context) {
+        if !self.devices.is_empty() || self.host.is_transfer_active() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_device_discovery_at {
+            let _ = self.host.refresh_devices();
+            self.next_device_discovery_at = now + DEVICE_DISCOVERY_RETRY_INTERVAL;
+        }
+        ctx.request_repaint_after(self.next_device_discovery_at.saturating_duration_since(now));
     }
 
     fn update_devices(&mut self, devices: Vec<DeviceInfo>) {
@@ -285,12 +406,14 @@ impl WireTermApp {
 
     fn resolve_playback_source(&mut self, item: &PlaylistItem) -> Result<PathBuf, String> {
         match &item.source {
-            PlaylistSource::Image { path } => Ok(path.clone()),
+            PlaylistSource::Image { path } => Ok(self.store.resolve_source_path(path)),
             PlaylistSource::ImageFolder { path } => self
                 .shuffle_bags
-                .resolve_turn(item.id, path)
+                .resolve_turn(item.id, &self.store.resolve_source_path(path))
                 .map_err(|error| error.to_string()),
-            PlaylistSource::Extension { path, .. } => Ok(extension_script_path(path)),
+            PlaylistSource::Extension { path, .. } => {
+                Ok(extension_script_path(&self.store.resolve_source_path(path)))
+            }
         }
     }
 
@@ -302,9 +425,15 @@ impl WireTermApp {
             return;
         };
         let path = match &item.source {
-            PlaylistSource::Image { path } => Ok(path.clone()),
-            PlaylistSource::ImageFolder { .. } => FolderShuffleBags::preview(&item.source),
-            PlaylistSource::Extension { path, .. } => Ok(extension_script_path(path)),
+            PlaylistSource::Image { path } => Ok(self.store.resolve_source_path(path)),
+            PlaylistSource::ImageFolder { path } => {
+                FolderShuffleBags::preview(&PlaylistSource::ImageFolder {
+                    path: self.store.resolve_source_path(path),
+                })
+            }
+            PlaylistSource::Extension { path, .. } => {
+                Ok(extension_script_path(&self.store.resolve_source_path(path)))
+            }
         };
         match path {
             Ok(path) => self.spawn_render(item, path, RenderPurpose::Preview),
@@ -341,7 +470,7 @@ impl WireTermApp {
             .expect("item render worker should start");
     }
 
-    fn begin_transfer(&mut self, frame: PanelFrame, label: String) {
+    fn begin_transfer(&mut self, item_id: ItemId, frame: PanelFrame, label: String) {
         let Some(port) = self.selected_port.clone() else {
             self.playback.failed(&self.playlist, Instant::now(), true);
             self.record_issue(
@@ -355,7 +484,11 @@ impl WireTermApp {
             Ok(()) => {
                 self.transfer_progress = 0.0;
                 "Connecting…".clone_into(&mut self.host_status);
-                self.pending_transfer = Some(PendingTransfer { label, frame });
+                self.pending_transfer = Some(PendingTransfer {
+                    item_id,
+                    label,
+                    frame,
+                });
             }
             Err(error) => {
                 self.playback.failed(&self.playlist, Instant::now(), false);
@@ -364,7 +497,13 @@ impl WireTermApp {
         }
     }
 
-    fn set_preview(&mut self, ctx: &egui::Context, frame: PanelFrame, label: String) {
+    fn set_preview(
+        &mut self,
+        ctx: &egui::Context,
+        item_id: ItemId,
+        frame: PanelFrame,
+        label: String,
+    ) {
         let image = egui::ColorImage::from_rgb([FRAME_WIDTH, FRAME_HEIGHT], frame.preview_rgb());
         let texture = ctx.load_texture(
             format!("playlist-preview-{}", frame.crc32()),
@@ -372,6 +511,7 @@ impl WireTermApp {
             egui::TextureOptions::NEAREST,
         );
         self.preview = Some(PreparedPreview {
+            item_id,
             frame: Arc::new(frame),
             texture,
             label,
@@ -407,7 +547,7 @@ impl WireTermApp {
         let id = self
             .playlist
             .add_item(title, PlaylistSource::Image { path });
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
     }
 
@@ -419,7 +559,7 @@ impl WireTermApp {
         let id = self
             .playlist
             .add_item(title, PlaylistSource::ImageFolder { path });
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
     }
 
@@ -445,7 +585,7 @@ impl WireTermApp {
                 named_secret_refs: BTreeMap::new(),
             },
         );
-        self.selected_item = Some(id);
+        self.select_item(id);
         self.save_playlist();
         self.extension_library_open = false;
     }
@@ -457,6 +597,21 @@ impl WireTermApp {
         self.playlist.items.retain(|item| item.id != id);
         self.interval_edits.remove(&id);
         self.extension_schemas.remove(&id);
+        self.extension_schema_errors.remove(&id);
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.item_id == id)
+        {
+            self.preview = None;
+        }
+        if self
+            .extension_schema_task
+            .as_ref()
+            .is_some_and(|task| task.item_id == id)
+        {
+            self.extension_schema_task = None;
+        }
         self.selected_item = self.playlist.items.first().map(|item| item.id);
         self.save_playlist();
     }
@@ -608,7 +763,7 @@ impl WireTermApp {
                                 number_clicked = number_response.clicked();
                             });
                             if number_clicked {
-                                self.selected_item = Some(item.id);
+                                self.select_item(item.id);
                             }
                             if ui
                                 .selectable_label(
@@ -617,7 +772,7 @@ impl WireTermApp {
                                 )
                                 .clicked()
                             {
-                                self.selected_item = Some(item.id);
+                                self.select_item(item.id);
                             }
                             ui.label(item.source.kind_name());
                             ui.label(format!(
@@ -901,9 +1056,14 @@ impl WireTermApp {
                 Some(PlaylistSource::Extension { .. })
             ) {
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Refresh preview to load this Extension’s inputs.").color(MUTED),
-                );
+                if let Some(error) = self.extension_schema_errors.get(&id) {
+                    ui.label(
+                        RichText::new(format!("Extension inputs could not be loaded: {error}"))
+                            .color(ACCENT),
+                    );
+                } else {
+                    ui.label(RichText::new("Loading Extension inputs…").color(MUTED));
+                }
             }
             return;
         };
@@ -1268,10 +1428,14 @@ impl WireTermApp {
 
 impl eframe::App for WireTermApp {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_extension_schema();
+        self.ensure_selected_extension_schema();
         self.poll_render(ctx);
         self.poll_host(ctx);
+        self.poll_device_discovery(ctx);
         self.poll_playback();
-        if self.render_task.is_some()
+        if self.extension_schema_task.is_some()
+            || self.render_task.is_some()
             || self.host.is_transfer_active()
             || self.playback.is_running()
         {
@@ -1409,6 +1573,10 @@ fn visual_qa_playlist() -> PlaylistRevision {
     playlist
 }
 
+fn preview_matches_selection(selected_item: Option<ItemId>, rendered_item: ItemId) -> bool {
+    selected_item == Some(rendered_item)
+}
+
 fn transfer_status(stage: &TransferStage) -> String {
     match stage {
         TransferStage::Connecting => "Connecting…".to_owned(),
@@ -1442,5 +1610,26 @@ mod tests {
             "unexpected device response during handshake".starts_with("unexpected device response")
         );
         assert!(!"could not open COM4".starts_with("unexpected device response"));
+    }
+
+    #[test]
+    fn preview_updates_only_for_the_selected_playlist_item() {
+        let mut playlist = PlaylistRevision::default();
+        let selected = playlist.add_item(
+            "Selected".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("selected.png"),
+            },
+        );
+        let other = playlist.add_item(
+            "Other".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("other.png"),
+            },
+        );
+
+        assert!(preview_matches_selection(Some(selected), selected));
+        assert!(!preview_matches_selection(Some(selected), other));
+        assert!(!preview_matches_selection(None, selected));
     }
 }

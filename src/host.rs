@@ -52,6 +52,7 @@ pub enum HostBridgeError {
 pub struct HostBridge {
     commands: SyncSender<HostCommand>,
     events: Receiver<HostEvent>,
+    discovery_active: Arc<AtomicBool>,
     transfer_active: Arc<AtomicBool>,
 }
 
@@ -69,22 +70,27 @@ impl HostBridge {
     pub fn new() -> Self {
         let (command_sender, command_receiver) = mpsc::sync_channel(4);
         let (event_sender, event_receiver) = mpsc::channel();
+        let discovery_active = Arc::new(AtomicBool::new(false));
         let transfer_active = Arc::new(AtomicBool::new(false));
+        let worker_discovery_active = Arc::clone(&discovery_active);
         let worker_active = Arc::clone(&transfer_active);
         thread::Builder::new()
             .name("wireterm-host-bridge".to_owned())
             .spawn(move || {
                 while let Ok(command) = command_receiver.recv() {
                     match command {
-                        HostCommand::DiscoverDevices => match transport::discover_devices() {
-                            Ok(devices) => {
-                                let _ = event_sender.send(HostEvent::DevicesChanged(devices));
+                        HostCommand::DiscoverDevices => {
+                            match transport::discover_devices() {
+                                Ok(devices) => {
+                                    let _ = event_sender.send(HostEvent::DevicesChanged(devices));
+                                }
+                                Err(error) => {
+                                    let _ = event_sender
+                                        .send(HostEvent::DeviceDiscoveryFailed(error.to_string()));
+                                }
                             }
-                            Err(error) => {
-                                let _ = event_sender
-                                    .send(HostEvent::DeviceDiscoveryFailed(error.to_string()));
-                            }
-                        },
+                            worker_discovery_active.store(false, Ordering::Release);
+                        }
                         HostCommand::SendFrame { port_name, frame } => {
                             let result = transport::send_frame(&port_name, &frame, |stage| {
                                 let _ = event_sender.send(HostEvent::TransferProgress(stage));
@@ -98,6 +104,7 @@ impl HostBridge {
                         HostCommand::Shutdown => break,
                     }
                 }
+                worker_discovery_active.store(false, Ordering::Release);
                 worker_active.store(false, Ordering::Release);
             })
             .expect("host bridge worker should start");
@@ -105,6 +112,7 @@ impl HostBridge {
         let bridge = Self {
             commands: command_sender,
             events: event_receiver,
+            discovery_active,
             transfer_active,
         };
         let _ = bridge.refresh_devices();
@@ -112,7 +120,18 @@ impl HostBridge {
     }
 
     pub fn refresh_devices(&self) -> Result<(), HostBridgeError> {
-        self.try_send_command(HostCommand::DiscoverDevices)
+        if self
+            .discovery_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.try_send_command(HostCommand::DiscoverDevices) {
+            self.discovery_active.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn send_frame(
@@ -187,5 +206,14 @@ mod tests {
             bridge.send_frame("COM1".to_owned(), frame),
             Err(HostBridgeError::TransferBusy)
         );
+    }
+
+    #[test]
+    fn bridge_coalesces_discovery_requests_while_one_is_active() {
+        let bridge = HostBridge::new();
+        bridge.discovery_active.store(true, Ordering::Release);
+
+        assert_eq!(bridge.refresh_devices(), Ok(()));
+        assert!(bridge.discovery_active.load(Ordering::Acquire));
     }
 }
