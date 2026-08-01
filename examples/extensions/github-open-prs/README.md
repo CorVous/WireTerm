@@ -1,6 +1,6 @@
 # GitHub open pull requests
 
-This ready-to-copy WireTerm 0.1.0 Extension shows up to five recently updated
+This ready-to-copy WireTerm 0.1.3 Extension shows up to five recently updated
 open pull requests authored by a GitHub username. It uses GitHub's official
 REST Search API, an Extension-owned masked token input, and direct black,
 white, and red SVG only.
