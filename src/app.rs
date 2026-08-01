@@ -41,6 +41,7 @@ use zeroize::{Zeroize, Zeroizing};
 const ACCENT: Color32 = Color32::from_rgb(232, 92, 70);
 const MUTED: Color32 = Color32::from_rgb(145, 151, 164);
 const PANEL_2: Color32 = Color32::from_rgb(42, 45, 52);
+const DEVICE_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 pub fn run() -> eframe::Result<()> {
     eframe::run_native(
@@ -105,6 +106,7 @@ struct WireTermApp {
     host: HostBridge,
     devices: Vec<DeviceInfo>,
     selected_port: Option<String>,
+    next_device_discovery_at: Instant,
     store: PlaylistStore,
     secret_store: SecretStore,
     secret_names: Vec<String>,
@@ -161,6 +163,7 @@ impl WireTermApp {
             host: HostBridge::new(),
             devices: Vec::new(),
             selected_port: None,
+            next_device_discovery_at: Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL,
             store,
             secret_store,
             secret_names,
@@ -295,10 +298,16 @@ impl WireTermApp {
     fn poll_host(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.host.try_recv() {
             match event {
-                HostEvent::DevicesChanged(devices) => self.update_devices(devices),
+                HostEvent::DevicesChanged(devices) => {
+                    self.update_devices(devices);
+                    self.next_device_discovery_at =
+                        Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL;
+                }
                 HostEvent::DeviceDiscoveryFailed(error) => {
                     "Device scan failed".clone_into(&mut self.host_status);
                     self.record_issue("Display bridge scan failed", error);
+                    self.next_device_discovery_at =
+                        Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL;
                 }
                 HostEvent::TransferProgress(stage) => {
                     self.transfer_progress = stage.progress();
@@ -325,6 +334,18 @@ impl WireTermApp {
                 }
             }
         }
+    }
+
+    fn poll_device_discovery(&mut self, ctx: &egui::Context) {
+        if !self.devices.is_empty() || self.host.is_transfer_active() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_device_discovery_at {
+            let _ = self.host.refresh_devices();
+            self.next_device_discovery_at = now + DEVICE_DISCOVERY_RETRY_INTERVAL;
+        }
+        ctx.request_repaint_after(self.next_device_discovery_at.saturating_duration_since(now));
     }
 
     fn update_devices(&mut self, devices: Vec<DeviceInfo>) {
@@ -1375,6 +1396,7 @@ impl eframe::App for WireTermApp {
         self.ensure_selected_extension_schema();
         self.poll_render(ctx);
         self.poll_host(ctx);
+        self.poll_device_discovery(ctx);
         self.poll_playback();
         if self.extension_schema_task.is_some()
             || self.render_task.is_some()
