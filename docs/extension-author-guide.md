@@ -8,9 +8,9 @@ Extension library. **Scaffold Extension** creates an editable working example.
 The script returns one table with `metadata`, `inputs`, and `render(context)`.
 Metadata requires a lowercase letter/number/hyphen `id`, display `name`, and a
 positive numeric `version`. Input kinds are `text`, `number`, `checkbox`,
-`choice`, and `named_secret`; choices need a non-empty `choices` list. Defaults
-must match their declared kind. `context.settings` contains validated non-secret
-values with defaults resolved.
+`choice`, and `secret`; choices need a non-empty `choices` list. Defaults must
+match their declared kind. `context.settings` contains every validated value,
+including Extension-owned secret inputs, with defaults resolved.
 
 ## Host APIs
 
@@ -19,7 +19,7 @@ local response = wireterm.http({
   method = "POST",                       -- default GET
   url = context.settings.endpoint,        -- http or https
   headers = { Accept = "application/json" },
-  secret_headers = { ["X-API-Key"] = "token" },
+  secret_headers = { ["X-API-Key"] = context.settings.token },
   body = "arbitrary bytes",
   timeout_ms = 15000,                     -- 1..60000
   max_redirects = 0,                      -- 0..10; default deny
@@ -33,12 +33,11 @@ validation. The 30-second overall render deadline can shorten a request.
 When `secret_headers` is non-empty, redirects never cross scheme, host, or port
 boundaries.
 
-`secret_headers` maps an outgoing header name to a logical `named_secret` input
-key. WireTerm resolves the Playlist Item's opaque binding and injects the value
-only while constructing the HTTP request. Lua never receives the value. Create
-or update values centrally under **Advanced details → Named secrets**.
-MVP values are stored locally without encryption under adjacent data; protect
-access to the portable folder.
+`secret_headers` maps an outgoing header name directly to its sensitive value.
+Declare that value as an input with `kind = "secret"`; WireTerm shows it beside
+the other Extension inputs with masked editing, and Lua receives it through
+`context.settings`. MVP values are stored without encryption in the Playlist
+revision under adjacent data; protect access to the portable folder.
 
 `wireterm.clock()` returns `unix_seconds` and `utc_offset_minutes`.
 `wireterm.asset("assets/picture.png")` validates a contained relative asset and

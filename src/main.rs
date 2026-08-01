@@ -1,4 +1,4 @@
-//! `WireTerm` foreground application entry point.
+//! `WireTerm` portable Windows host entry point.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 

@@ -343,7 +343,7 @@ end
 
 local function fail_for_status(response)
   if response.status == 401 then
-    error("GitHub authentication failed; check the named secret binding")
+    error("GitHub authentication failed; check the token")
   end
   if response.status == 403 or response.status == 429 then
     if response.status == 429
@@ -391,7 +391,7 @@ local extension = {
     {
       key = "github_token",
       label = "GitHub token",
-      kind = "named_secret",
+      kind = "secret",
       required = true,
     },
   },
@@ -416,7 +416,7 @@ function extension.render(context)
       ["User-Agent"] = "WireTerm-GitHub-Open-PRs/1.0",
       ["X-GitHub-Api-Version"] = "2022-11-28",
     },
-    secret_headers = { Authorization = "github_token" },
+    secret_headers = { Authorization = "Bearer " .. context.settings.github_token },
     timeout_ms = 15000,
     max_redirects = 0,
   })

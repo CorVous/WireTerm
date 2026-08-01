@@ -207,8 +207,6 @@ pub enum PlaylistSource {
         path: PathBuf,
         #[serde(default)]
         settings: BTreeMap<String, Value>,
-        #[serde(default)]
-        named_secret_refs: BTreeMap<String, String>,
     },
 }
 

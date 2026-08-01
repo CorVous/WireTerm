@@ -1,8 +1,8 @@
 # GitHub open pull requests
 
-This ready-to-copy WireTerm 0.1.0 Extension shows up to five recently updated
+This ready-to-copy WireTerm 0.1.3 Extension shows up to five recently updated
 open pull requests authored by a GitHub username. It uses GitHub's official
-REST Search API, a WireTerm named-secret header binding, and direct black,
+REST Search API, an Extension-owned masked token input, and direct black,
 white, and red SVG only.
 
 ## Install
@@ -16,22 +16,17 @@ white, and red SVG only.
    repository permissions, but this sample still requires a token for a
    consistent authenticated rate limit. GitHub documents token creation and
    permission selection in [Managing your personal access tokens](https://docs.github.com/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
-3. In WireTerm, expand **Advanced details**, create a named secret such as
-   `github-read`, and set its value to `Bearer YOUR_TOKEN`. The `Bearer ` prefix
-   is required because WireTerm injects the stored value as the complete
-   `Authorization` header. MVP named secrets are stored unencrypted in the
-   adjacent `wireterm-data` folder; protect access to that folder.
-4. Choose **+ Extension**, select **GitHub open pull requests**, bind its
-   **GitHub token** input to `github-read`, and leave **GitHub username** as
-   `CorVous` or replace it with another account name.
-5. Apply the item, select it, and use **Refresh preview**. Preview performs one
+3. Choose **+ Extension**, select **GitHub open pull requests**, enter the token
+   in its masked **GitHub token** field, and leave **GitHub username** as
+   `CorVous` or replace it with another account name. Enter only the token;
+   the Extension adds the required `Bearer ` prefix.
+4. Apply the item, select it, and use **Refresh preview**. Preview performs one
    bounded read-only request and does not send a panel frame or consume a
    playback turn.
 
-Never paste a token into the username setting or into `extension.lua`. The
-script passes only the opaque `github_token` reference through
-`secret_headers`; the secret value is injected by WireTerm at the final HTTP
-request boundary.
+Never paste a token into the username setting or into `extension.lua`. WireTerm
+masks the token while editing, but MVP Playlist revisions store Extension inputs
+unencrypted in the adjacent `wireterm-data` folder; protect access to that folder.
 
 ## GitHub access caveats
 

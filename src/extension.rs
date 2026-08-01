@@ -28,7 +28,6 @@ use crate::{
     frame::{FrameError, PIXEL_COUNT, PanelColor, PanelFrame},
     playlist::is_safe_relative_asset_path,
     raster::dither_raster_asset,
-    secrets::SecretStore,
 };
 
 pub const EXTENSION_SCRIPT_NAME: &str = "extension.lua";
@@ -71,7 +70,7 @@ pub enum InputKind {
     Number,
     Checkbox,
     Choice,
-    NamedSecret,
+    Secret,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,8 +78,8 @@ pub struct HostHttpRequest {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
-    /// Header name to app-owned named-secret reference. Secret values are
-    /// injected only by the eventual live HTTP host and never enter Lua.
+    /// Header name to a sensitive value supplied by the Extension. These
+    /// values are never included in host logs or cross-origin redirects.
     pub secret_headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
     pub timeout: Duration,
@@ -116,8 +115,6 @@ pub enum HostApiError {
     TimeLimit,
     #[error("HTTP response exceeded the 5 MiB limit")]
     ResponseTooLarge,
-    #[error("named secret reference is not bound")]
-    SecretNotBound,
     #[error("asset path must be local, relative, and contained by the Extension")]
     UnsafeAssetPath,
     #[error("local asset is unavailable")]
@@ -181,8 +178,6 @@ impl ExtensionHostApi for SchemaExtensionHost {
 /// timeout and the render's remaining overall budget.
 pub struct LiveExtensionHost {
     extension_root: PathBuf,
-    named_secret_refs: BTreeMap<String, String>,
-    secrets: SecretStore,
     clock: HostClock,
     started: Instant,
     cancellation: RenderCancellation,
@@ -192,16 +187,12 @@ impl LiveExtensionHost {
     #[must_use]
     pub const fn new(
         extension_root: PathBuf,
-        named_secret_refs: BTreeMap<String, String>,
-        secrets: SecretStore,
         clock: HostClock,
         started: Instant,
         cancellation: RenderCancellation,
     ) -> Self {
         Self {
             extension_root,
-            named_secret_refs,
-            secrets,
             clock,
             started,
             cancellation,
@@ -219,21 +210,12 @@ impl LiveExtensionHost {
     }
 
     fn resolve_secret_headers(
-        &self,
-        references: BTreeMap<String, String>,
+        values: BTreeMap<String, String>,
     ) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, HostApiError>
     {
-        references
+        values
             .into_iter()
-            .map(|(header_name, input_key)| {
-                let secret_name = self
-                    .named_secret_refs
-                    .get(&input_key)
-                    .ok_or(HostApiError::SecretNotBound)?;
-                let value = self
-                    .secrets
-                    .resolve(secret_name)
-                    .map_err(|_| HostApiError::SecretNotBound)?;
+            .map(|(header_name, value)| {
                 let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
                     .map_err(|_| HostApiError::InvalidHttp)?;
                 let mut header = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
@@ -291,7 +273,7 @@ impl ExtensionHostApi for LiveExtensionHost {
                 .map_err(|_| HostApiError::InvalidHttp)?;
             builder = builder.header(name, value);
         }
-        for (name, value) in self.resolve_secret_headers(request.secret_headers)? {
+        for (name, value) in Self::resolve_secret_headers(request.secret_headers)? {
             builder = builder.header(name, value);
         }
         let mut response = builder.send().map_err(|error| {
@@ -352,7 +334,6 @@ struct FixtureRequestKey {
 /// Deterministic host used by local previews, fixtures, and conformance tests.
 pub struct LocalFixtureHost {
     extension_root: PathBuf,
-    named_secret_refs: BTreeMap<String, String>,
     responses: BTreeMap<FixtureRequestKey, HostHttpResponse>,
     clock: HostClock,
     requests: Mutex<Vec<HostHttpRequest>>,
@@ -360,14 +341,9 @@ pub struct LocalFixtureHost {
 
 impl LocalFixtureHost {
     #[must_use]
-    pub const fn new(
-        extension_root: PathBuf,
-        named_secret_refs: BTreeMap<String, String>,
-        clock: HostClock,
-    ) -> Self {
+    pub const fn new(extension_root: PathBuf, clock: HostClock) -> Self {
         Self {
             extension_root,
-            named_secret_refs,
             responses: BTreeMap::new(),
             clock,
             requests: Mutex::new(Vec::new()),
@@ -401,13 +377,7 @@ impl LocalFixtureHost {
 }
 
 impl ExtensionHostApi for LocalFixtureHost {
-    fn http(&self, mut request: HostHttpRequest) -> Result<HostHttpResponse, HostApiError> {
-        for logical_name in request.secret_headers.values_mut() {
-            let Some(named_reference) = self.named_secret_refs.get(logical_name) else {
-                return Err(HostApiError::SecretNotBound);
-            };
-            named_reference.clone_into(logical_name);
-        }
+    fn http(&self, request: HostHttpRequest) -> Result<HostHttpResponse, HostApiError> {
         self.requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -628,64 +598,28 @@ fn validate_inputs(inputs: &[ExtensionInput]) -> Result<(), ExtensionError> {
 
 fn value_matches_kind(value: &Value, kind: InputKind) -> bool {
     match kind {
-        InputKind::Text | InputKind::Choice => value.is_string(),
+        InputKind::Text | InputKind::Choice | InputKind::Secret => value.is_string(),
         InputKind::Number => value.is_number(),
         InputKind::Checkbox => value.is_boolean(),
-        InputKind::NamedSecret => false,
     }
 }
 
-/// Resolve defaults and validate settings plus opaque named-secret bindings.
+/// Resolve defaults and validate all Extension-owned settings.
 pub fn validate_extension_configuration(
     inputs: &[ExtensionInput],
     settings: &BTreeMap<String, Value>,
-    named_secret_refs: &BTreeMap<String, String>,
-    available_secret_names: &[String],
 ) -> Result<BTreeMap<String, Value>, ExtensionError> {
     let declared = inputs
         .iter()
         .map(|input| input.key.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let secret_inputs = inputs
-        .iter()
-        .filter(|input| input.kind == InputKind::NamedSecret)
-        .map(|input| input.key.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    if settings
-        .keys()
-        .any(|key| !declared.contains(key.as_str()) || secret_inputs.contains(key.as_str()))
-        || named_secret_refs
-            .keys()
-            .any(|key| !secret_inputs.contains(key.as_str()))
-    {
+    if settings.keys().any(|key| !declared.contains(key.as_str())) {
         return Err(ExtensionError::Configuration(
-            "a saved setting or secret binding is not declared in the correct input class"
-                .to_owned(),
+            "a saved setting is not declared by the Extension".to_owned(),
         ));
     }
-    let available = available_secret_names
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
     let mut resolved = BTreeMap::new();
     for input in inputs {
-        if input.kind == InputKind::NamedSecret {
-            match named_secret_refs.get(&input.key) {
-                Some(name) if available.contains(name.as_str()) => {}
-                Some(_) => {
-                    return Err(ExtensionError::Configuration(
-                        "a named-secret binding is unavailable".to_owned(),
-                    ));
-                }
-                None if input.required => {
-                    return Err(ExtensionError::Configuration(
-                        "a required named-secret input is not bound".to_owned(),
-                    ));
-                }
-                None => {}
-            }
-            continue;
-        }
         let value = settings
             .get(&input.key)
             .filter(|value| !value.is_null())
@@ -700,7 +634,10 @@ pub fn validate_extension_configuration(
             continue;
         };
         if (input.required
-            && matches!(input.kind, InputKind::Text | InputKind::Choice)
+            && matches!(
+                input.kind,
+                InputKind::Text | InputKind::Choice | InputKind::Secret
+            )
             && value.as_str().is_some_and(str::is_empty))
             || !value_matches_kind(&value, input.kind)
             || (input.kind == InputKind::Choice
@@ -1144,15 +1081,9 @@ mod tests {
         }
     }
 
-    fn live_host(
-        root: &Path,
-        refs: BTreeMap<String, String>,
-        cancellation: RenderCancellation,
-    ) -> LiveExtensionHost {
+    fn live_host(root: &Path, cancellation: RenderCancellation) -> LiveExtensionHost {
         LiveExtensionHost::new(
             root.to_path_buf(),
-            refs,
-            SecretStore::new(root),
             HostClock {
                 unix_seconds: 1_700_000_000,
                 utc_offset_minutes: 0,
@@ -1226,7 +1157,7 @@ mod tests {
                 { key = "count", label = "Count", kind = "number", required = false, default = 3 },
                 { key = "enabled", label = "Enabled", kind = "checkbox", required = false, default = true },
                 { key = "style", label = "Style", kind = "choice", required = true, default = "plain", choices = { "plain", "bold" } },
-                { key = "token", label = "Token", kind = "named_secret", required = true },
+                { key = "token", label = "Token", kind = "secret", required = true },
               },
               render = function()
                 error("schema loading must not call render")
@@ -1244,7 +1175,7 @@ mod tests {
         assert_eq!(inputs[1].kind, InputKind::Number);
         assert_eq!(inputs[2].kind, InputKind::Checkbox);
         assert_eq!(inputs[3].kind, InputKind::Choice);
-        assert_eq!(inputs[4].kind, InputKind::NamedSecret);
+        assert_eq!(inputs[4].kind, InputKind::Secret);
     }
 
     #[test]
@@ -1271,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn self_describing_lua_handles_arbitrary_fixture_payload_and_secret_reference() {
+    fn self_describing_lua_handles_arbitrary_fixture_payload_and_secret_input() {
         let fixture = TestExtension::new();
         let script = r##"
             local module = {
@@ -1283,7 +1214,7 @@ mod tests {
               },
               inputs = {
                 { key = "title", label = "Title", kind = "text", required = true },
-                { key = "token", label = "API token", kind = "named_secret", required = true },
+                { key = "token", label = "API token", kind = "secret", required = true },
               },
             }
             function module.render(context)
@@ -1291,7 +1222,7 @@ mod tests {
                 method = "POST",
                 url = "fixture://arbitrary",
                 headers = { ["Content-Type"] = "application/octet-stream" },
-                secret_headers = { Authorization = "token" },
+                secret_headers = { Authorization = context.settings.token },
                 body = "request bytes",
               })
               local asset = wireterm.asset("assets/pixel.png")
@@ -1313,7 +1244,6 @@ mod tests {
         let host = Arc::new(
             LocalFixtureHost::new(
                 fixture.0.clone(),
-                BTreeMap::from([("token".to_owned(), "github-production".to_owned())]),
                 HostClock {
                     unix_seconds: 1_700_000_000,
                     utc_offset_minutes: 0,
@@ -1334,7 +1264,13 @@ mod tests {
         );
         let (metadata, inputs, frame) = render_local_fixture(
             &script_path,
-            &BTreeMap::from([("title".to_owned(), Value::String("Hello".to_owned()))]),
+            &BTreeMap::from([
+                ("title".to_owned(), Value::String("Hello".to_owned())),
+                (
+                    "token".to_owned(),
+                    Value::String("github-production".to_owned()),
+                ),
+            ]),
             host.clone(),
         )
         .expect("fixture render");
@@ -1408,7 +1344,7 @@ mod tests {
         let (requests, server) =
             serve_on(listener, vec![redirect.clone(), redirect, final_response]);
         let base = format!("http://{address}");
-        let host = live_host(&fixture.0, BTreeMap::new(), RenderCancellation::default());
+        let host = live_host(&fixture.0, RenderCancellation::default());
 
         let denied = host
             .http(request(format!("{base}/redirect")))
@@ -1433,7 +1369,7 @@ mod tests {
         )
         .into_bytes();
         let (base, _, server) = serve_responses(vec![oversized]);
-        let host = live_host(&fixture.0, BTreeMap::new(), RenderCancellation::default());
+        let host = live_host(&fixture.0, RenderCancellation::default());
         assert!(matches!(
             host.http(request(base)),
             Err(HostApiError::ResponseTooLarge)
@@ -1453,26 +1389,19 @@ mod tests {
     }
 
     #[test]
-    fn named_secret_is_injected_only_at_final_http_boundary() {
+    fn sensitive_header_is_sent_without_appearing_in_errors() {
         let fixture = TestExtension::new();
-        let store = SecretStore::new(&fixture.0);
-        store.set("api-key", "never-log-this").expect("secret");
         let (base, requests, server) = serve_responses(vec![
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ]);
-        let host = live_host(
-            &fixture.0,
-            BTreeMap::from([("token".to_owned(), "api-key".to_owned())]),
-            RenderCancellation::default(),
-        );
+        let host = live_host(&fixture.0, RenderCancellation::default());
         let mut http_request = request(base);
         http_request.secret_headers =
-            BTreeMap::from([("Authorization".to_owned(), "token".to_owned())]);
+            BTreeMap::from([("Authorization".to_owned(), "never-log-this".to_owned())]);
         host.http(http_request).expect("secret request");
         server.join().expect("secret server");
         let wire = requests.recv().expect("captured requests").remove(0);
         assert!(wire.windows(14).any(|window| window == b"never-log-this"));
-        assert!(!format!("{:?}", host.secrets).contains("never-log-this"));
         assert_eq!(HostApiError::Http.to_string(), "HTTP request failed");
     }
 
@@ -1494,7 +1423,7 @@ mod tests {
         fs::write(&script_path, script).expect("sandbox script");
         let cancellation = RenderCancellation::default();
         cancellation.cancel();
-        let host = Arc::new(live_host(&fixture.0, BTreeMap::new(), cancellation));
+        let host = Arc::new(live_host(&fixture.0, cancellation));
         let extension = LoadedExtension::load(&script_path, host).expect("load sandbox");
         let error = extension
             .render_svg(&BTreeMap::new())
@@ -1503,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_resolves_defaults_and_rejects_secret_values_in_settings() {
+    fn configuration_resolves_defaults_and_extension_owned_secrets() {
         let inputs = vec![
             ExtensionInput {
                 key: "title".to_owned(),
@@ -1516,29 +1445,23 @@ mod tests {
             ExtensionInput {
                 key: "token".to_owned(),
                 label: "Token".to_owned(),
-                kind: InputKind::NamedSecret,
+                kind: InputKind::Secret,
                 required: true,
                 default: Value::Null,
                 choices: Vec::new(),
             },
         ];
-        let refs = BTreeMap::from([("token".to_owned(), "api-key".to_owned())]);
-        let resolved = validate_extension_configuration(
-            &inputs,
-            &BTreeMap::new(),
-            &refs,
-            &["api-key".to_owned()],
-        )
-        .expect("valid configuration");
-        assert_eq!(resolved["title"], "Default title");
-        assert!(!resolved.contains_key("token"));
-
-        let leaked = BTreeMap::from([(
+        let settings = BTreeMap::from([(
             "token".to_owned(),
-            Value::String("must-not-be-a-setting".to_owned()),
+            Value::String("plain-local-secret".to_owned()),
         )]);
+        let resolved =
+            validate_extension_configuration(&inputs, &settings).expect("valid configuration");
+        assert_eq!(resolved["title"], "Default title");
+        assert_eq!(resolved["token"], "plain-local-secret");
+
         assert!(matches!(
-            validate_extension_configuration(&inputs, &leaked, &refs, &["api-key".to_owned()]),
+            validate_extension_configuration(&inputs, &BTreeMap::new()),
             Err(ExtensionError::Configuration(_))
         ));
     }
@@ -1546,8 +1469,6 @@ mod tests {
     #[test]
     fn secret_header_redirect_does_not_cross_origins() {
         let fixture = TestExtension::new();
-        let store = SecretStore::new(&fixture.0);
-        store.set("api-key", "never-forward").expect("secret");
         let destination = TcpListener::bind("127.0.0.1:0").expect("destination");
         destination.set_nonblocking(true).expect("nonblocking");
         let destination_url = format!(
@@ -1559,15 +1480,11 @@ mod tests {
         )
         .into_bytes();
         let (origin, _, server) = serve_responses(vec![redirect]);
-        let host = live_host(
-            &fixture.0,
-            BTreeMap::from([("token".to_owned(), "api-key".to_owned())]),
-            RenderCancellation::default(),
-        );
+        let host = live_host(&fixture.0, RenderCancellation::default());
         let mut http_request = request(origin);
         http_request.max_redirects = 2;
         http_request.secret_headers =
-            BTreeMap::from([("X-Api-Key".to_owned(), "token".to_owned())]);
+            BTreeMap::from([("X-Api-Key".to_owned(), "never-forward".to_owned())]);
         assert_eq!(
             host.http(http_request).expect("stopped redirect").status,
             302
@@ -1599,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn github_open_prs_example_renders_deterministic_fixture_without_secret_leakage() {
+    fn github_open_prs_example_renders_fixture_with_extension_owned_token() {
         let fixture = TestExtension::new();
         let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
         fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
@@ -1622,12 +1539,10 @@ mod tests {
             }
           ]
         }"#;
-        let secret_name = "fixture-github-authorization";
-        let secret_refs = BTreeMap::from([("github_token".to_owned(), secret_name.to_owned())]);
+        let secret_value = "fixture-github-authorization";
         let host = Arc::new(
             LocalFixtureHost::new(
                 fixture.0.clone(),
-                secret_refs.clone(),
                 HostClock {
                     unix_seconds: 1_785_484_800,
                     utc_offset_minutes: 0,
@@ -1645,23 +1560,23 @@ mod tests {
         );
         let extension =
             LoadedExtension::load(&script_path, host.clone()).expect("load GitHub example");
-        let settings =
-            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
-        let resolved = validate_extension_configuration(
-            &extension.inputs,
-            &settings,
-            &secret_refs,
-            &[secret_name.to_owned()],
-        )
-        .expect("valid GitHub example settings");
+        let settings = BTreeMap::from([
+            ("username".to_owned(), Value::String("CorVous".to_owned())),
+            (
+                "github_token".to_owned(),
+                Value::String(secret_value.to_owned()),
+            ),
+        ]);
+        let resolved = validate_extension_configuration(&extension.inputs, &settings)
+            .expect("valid GitHub example settings");
         let svg = extension.render_svg(&resolved).expect("GitHub fixture SVG");
 
         assert!(svg.contains("example/private-repo"));
         assert!(svg.contains("#42"));
         assert!(svg.contains("Fix &lt;parser&gt; &amp; &quot;quotes&quot; 🚀"));
         assert!(svg.contains("(untitled pull request)"));
-        assert!(!svg.contains(secret_name));
-        assert!(!resolved.contains_key("github_token"));
+        assert!(!svg.contains(secret_value));
+        assert_eq!(resolved["github_token"], secret_value);
         let frame = render_svg_to_panel(&svg, &fixture.0).expect("GitHub fixture frame");
         assert_eq!(frame.payload().len(), crate::frame::FRAME_BYTES);
 
@@ -1676,8 +1591,11 @@ mod tests {
             request.headers["User-Agent"],
             "WireTerm-GitHub-Open-PRs/1.0"
         );
-        assert_eq!(request.secret_headers["Authorization"], secret_name);
-        assert!(!request.url.contains(secret_name));
+        assert_eq!(
+            request.secret_headers["Authorization"],
+            format!("Bearer {secret_value}")
+        );
+        assert!(!request.url.contains(secret_value));
     }
 
     #[test]
@@ -1686,17 +1604,17 @@ mod tests {
         let script_path = fixture.0.join(EXTENSION_SCRIPT_NAME);
         fs::write(&script_path, GITHUB_OPEN_PRS_LUA).expect("GitHub example script");
         let url = "https://api.github.com/search/issues?q=type%3Apr%20state%3Aopen%20author%3ACorVous&sort=updated&order=desc&per_page=5";
-        let secret_refs = BTreeMap::from([(
-            "github_token".to_owned(),
-            "fixture-github-authorization".to_owned(),
-        )]);
-        let settings =
-            BTreeMap::from([("username".to_owned(), Value::String("CorVous".to_owned()))]);
+        let settings = BTreeMap::from([
+            ("username".to_owned(), Value::String("CorVous".to_owned())),
+            (
+                "github_token".to_owned(),
+                Value::String("fixture-github-authorization".to_owned()),
+            ),
+        ]);
 
         let empty_host = Arc::new(
             LocalFixtureHost::new(
                 fixture.0.clone(),
-                secret_refs.clone(),
                 HostClock {
                     unix_seconds: 1_785_484_800,
                     utc_offset_minutes: 0,
@@ -1723,7 +1641,6 @@ mod tests {
         let rate_host = Arc::new(
             LocalFixtureHost::new(
                 fixture.0.clone(),
-                secret_refs,
                 HostClock {
                     unix_seconds: 1_785_484_800,
                     utc_offset_minutes: 0,
@@ -1759,17 +1676,12 @@ mod tests {
         let (base, _, server) = serve_responses(vec![
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"full_name\":\"local/fixture\"}".to_vec(),
         ]);
-        let host = Arc::new(live_host(
-            &root,
-            BTreeMap::new(),
-            RenderCancellation::default(),
-        ));
+        let host = Arc::new(live_host(&root, RenderCancellation::default()));
         let extension =
             LoadedExtension::load(&root.join(EXTENSION_SCRIPT_NAME), host).expect("example load");
         let settings = BTreeMap::from([("endpoint".to_owned(), Value::String(base))]);
-        let resolved =
-            validate_extension_configuration(&extension.inputs, &settings, &BTreeMap::new(), &[])
-                .expect("example settings");
+        let resolved = validate_extension_configuration(&extension.inputs, &settings)
+            .expect("example settings");
         let svg = extension.render_svg(&resolved).expect("example svg");
         let frame = render_svg_to_panel(&svg, &root).expect("example frame");
         assert_eq!(frame.payload().len(), crate::frame::FRAME_BYTES);

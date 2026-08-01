@@ -44,7 +44,7 @@ pub enum HostBridgeError {
     CommandQueueFull,
 }
 
-/// Owns the sole serial worker used by the foreground application.
+/// Owns the sole serial worker used by the host process.
 ///
 /// The GUI and future playback host submit display-ready [`PanelFrame`] values
 /// here. Serial discovery, protocol state, CRC framing, and transfer
