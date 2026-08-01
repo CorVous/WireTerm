@@ -126,6 +126,7 @@ struct WireTermApp {
     playback: PlaybackController,
     shuffle_bags: FolderShuffleBags,
     render_task: Option<RenderTask>,
+    preview_request: Option<ItemId>,
     pending_transfer: Option<PendingTransfer>,
     preview: Option<PreparedPreview>,
     transfer_progress: f32,
@@ -183,6 +184,7 @@ impl WireTermApp {
             playback,
             shuffle_bags: FolderShuffleBags::default(),
             render_task: None,
+            preview_request: selected_item,
             pending_transfer: None,
             preview: None,
             transfer_progress: 0.0,
@@ -293,7 +295,7 @@ impl WireTermApp {
     }
 
     fn select_item(&mut self, item_id: ItemId) {
-        if self.selected_item != Some(item_id) {
+        if selection_preview_request(self.selected_item, item_id).is_some() {
             self.extension_schema_errors.remove(&item_id);
             if self
                 .preview
@@ -302,6 +304,7 @@ impl WireTermApp {
             {
                 self.preview = None;
             }
+            self.preview_request = Some(item_id);
         }
         self.selected_item = Some(item_id);
     }
@@ -417,10 +420,19 @@ impl WireTermApp {
         }
     }
 
-    fn refresh_preview(&mut self) {
-        let Some(item_id) = self.selected_item else {
+    fn poll_preview_request(&mut self) {
+        if self.render_task.is_some()
+            || self.pending_transfer.is_some()
+            || self.host.is_transfer_active()
+        {
+            return;
+        }
+        let Some(item_id) = self.preview_request.take() else {
             return;
         };
+        if self.selected_item != Some(item_id) {
+            return;
+        }
         let Some(item) = self.playlist.item(item_id).cloned() else {
             return;
         };
@@ -439,6 +451,10 @@ impl WireTermApp {
             Ok(path) => self.spawn_render(item, path, RenderPurpose::Preview),
             Err(error) => self.record_issue("Preview failed", error.to_string()),
         }
+    }
+
+    const fn refresh_preview(&mut self) {
+        self.preview_request = self.selected_item;
     }
 
     fn spawn_render(&mut self, item: PlaylistItem, path: PathBuf, purpose: RenderPurpose) {
@@ -612,7 +628,11 @@ impl WireTermApp {
         {
             self.extension_schema_task = None;
         }
-        self.selected_item = self.playlist.items.first().map(|item| item.id);
+        self.selected_item = None;
+        self.preview_request = None;
+        if let Some(item_id) = self.playlist.items.first().map(|item| item.id) {
+            self.select_item(item_id);
+        }
         self.save_playlist();
     }
 
@@ -1433,9 +1453,11 @@ impl eframe::App for WireTermApp {
         self.poll_render(ctx);
         self.poll_host(ctx);
         self.poll_device_discovery(ctx);
+        self.poll_preview_request();
         self.poll_playback();
         if self.extension_schema_task.is_some()
             || self.render_task.is_some()
+            || self.preview_request.is_some()
             || self.host.is_transfer_active()
             || self.playback.is_running()
         {
@@ -1577,6 +1599,13 @@ fn preview_matches_selection(selected_item: Option<ItemId>, rendered_item: ItemI
     selected_item == Some(rendered_item)
 }
 
+fn selection_preview_request(
+    previous_selection: Option<ItemId>,
+    selected: ItemId,
+) -> Option<ItemId> {
+    (previous_selection != Some(selected)).then_some(selected)
+}
+
 fn transfer_status(stage: &TransferStage) -> String {
     match stage {
         TransferStage::Connecting => "Connecting…".to_owned(),
@@ -1631,5 +1660,26 @@ mod tests {
         assert!(preview_matches_selection(Some(selected), selected));
         assert!(!preview_matches_selection(Some(selected), other));
         assert!(!preview_matches_selection(None, selected));
+    }
+
+    #[test]
+    fn changing_selection_requests_a_preview_without_repeating_the_current_one() {
+        let mut playlist = PlaylistRevision::default();
+        let first = playlist.add_item(
+            "First".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("first.png"),
+            },
+        );
+        let second = playlist.add_item(
+            "Second".to_owned(),
+            PlaylistSource::Image {
+                path: PathBuf::from("second.png"),
+            },
+        );
+
+        assert_eq!(selection_preview_request(None, first), Some(first));
+        assert_eq!(selection_preview_request(Some(first), second), Some(second));
+        assert_eq!(selection_preview_request(Some(second), second), None);
     }
 }
