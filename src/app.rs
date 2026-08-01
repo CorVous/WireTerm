@@ -35,12 +35,11 @@ use crate::{
         PlaylistRevision, PlaylistSource, PlaylistStore,
     },
     raster::prepare_raster_path,
-    secrets::SecretStore,
     transport::{DeviceInfo, TransferStage},
 };
-use zeroize::{Zeroize, Zeroizing};
 
 const ACCENT: Color32 = Color32::from_rgb(232, 92, 70);
+const SELECTED: Color32 = Color32::from_rgb(92, 190, 112);
 const MUTED: Color32 = Color32::from_rgb(145, 151, 164);
 const PANEL_2: Color32 = Color32::from_rgb(42, 45, 52);
 const DEVICE_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(3);
@@ -126,10 +125,6 @@ struct WireTermApp {
     selected_port: Option<String>,
     next_device_discovery_at: Instant,
     store: PlaylistStore,
-    secret_store: SecretStore,
-    secret_names: Vec<String>,
-    secret_name_edit: String,
-    secret_value_edit: Zeroizing<String>,
     extension_library_open: bool,
     discovered_extensions: Vec<PathBuf>,
     playlist: PlaylistRevision,
@@ -168,8 +163,6 @@ impl WireTermApp {
                 }),
             ),
         };
-        let secret_store = SecretStore::new(store.data_dir());
-        let secret_names = secret_store.names().unwrap_or_default();
         let discovered_extensions = discover_extensions(store.data_dir()).unwrap_or_default();
         let visual_qa = std::env::var_os("WIRETERM_VISUAL_QA").is_some();
         if visual_qa {
@@ -203,10 +196,6 @@ impl WireTermApp {
             selected_port: None,
             next_device_discovery_at: Instant::now() + DEVICE_DISCOVERY_RETRY_INTERVAL,
             store,
-            secret_store,
-            secret_names,
-            secret_name_edit: String::new(),
-            secret_value_edit: Zeroizing::new(String::new()),
             extension_library_open: false,
             discovered_extensions,
             playlist,
@@ -552,7 +541,6 @@ impl WireTermApp {
         }
         let item_id = item.id;
         let label = source_label(&path);
-        let secrets = self.secret_store.clone();
         let cancellation = RenderCancellation::default();
         let (sender, receiver) = mpsc::channel();
         self.render_task = Some(RenderTask {
@@ -563,7 +551,7 @@ impl WireTermApp {
         thread::Builder::new()
             .name("wireterm-item-render".to_owned())
             .spawn(move || {
-                let rendered = render_item(&item, &path, &secrets, cancellation);
+                let rendered = render_item(&item, &path, cancellation);
                 let _ = sender.send(RenderResult {
                     purpose,
                     item_id,
@@ -687,7 +675,6 @@ impl WireTermApp {
             PlaylistSource::Extension {
                 path,
                 settings: BTreeMap::new(),
-                named_secret_refs: BTreeMap::new(),
             },
         );
         self.select_item(id);
@@ -830,7 +817,9 @@ impl WireTermApp {
                         for (index, item) in self.playlist.items.clone().into_iter().enumerate() {
                             let selected = self.selected_item == Some(item.id);
                             let is_current = current == Some(item.id);
-                            let row_color = if is_current {
+                            let row_color = if selected {
+                                SELECTED
+                            } else if is_current {
                                 ACCENT
                             } else {
                                 ui.visuals().text_color()
@@ -885,13 +874,8 @@ impl WireTermApp {
                             }
                             ui.label(item.source.kind_name());
                             ui.label(format!(
-                                "{}m{}",
-                                self.playlist.effective_interval_minutes(&item),
-                                if item.interval_minutes.is_some() {
-                                    " item"
-                                } else {
-                                    ""
-                                }
+                                "{}m",
+                                self.playlist.effective_interval_minutes(&item)
                             ));
                             let (handle_rect, handle) =
                                 ui.allocate_exact_size(Vec2::new(28.0, 20.0), Sense::drag());
@@ -1191,7 +1175,7 @@ impl WireTermApp {
                     InputKind::Text => {
                         let mut value = configured_value.as_str().unwrap_or_default().to_owned();
                         if ui.text_edit_singleline(&mut value).changed() {
-                            changes.push((input.key.clone(), Value::String(value), false));
+                            changes.push((input.key.clone(), Value::String(value)));
                         }
                     }
                     InputKind::Number => {
@@ -1199,13 +1183,13 @@ impl WireTermApp {
                         if ui.add(egui::DragValue::new(&mut value)).changed()
                             && let Some(number) = serde_json::Number::from_f64(value)
                         {
-                            changes.push((input.key.clone(), Value::Number(number), false));
+                            changes.push((input.key.clone(), Value::Number(number)));
                         }
                     }
                     InputKind::Checkbox => {
                         let mut value = configured_value.as_bool().unwrap_or_default();
                         if ui.checkbox(&mut value, "").changed() {
-                            changes.push((input.key.clone(), Value::Bool(value), false));
+                            changes.push((input.key.clone(), Value::Bool(value)));
                         }
                     }
                     InputKind::Choice => {
@@ -1222,33 +1206,27 @@ impl WireTermApp {
                                 }
                             });
                         if value != self.extension_setting_string(id, &input.key) {
-                            changes.push((input.key.clone(), Value::String(value), false));
+                            changes.push((input.key.clone(), Value::String(value)));
                         }
                     }
-                    InputKind::NamedSecret => {
-                        let mut value = self.extension_secret_ref(id, &input.key);
-                        egui::ComboBox::from_id_salt(("extension-secret", id.get(), &input.key))
-                            .selected_text(if value.is_empty() {
-                                "Not bound"
-                            } else {
-                                &value
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut value, String::new(), "Not bound");
-                                for name in &self.secret_names {
-                                    ui.selectable_value(&mut value, name.clone(), name);
-                                }
-                            });
-                        if value != self.extension_secret_ref(id, &input.key) {
-                            changes.push((input.key.clone(), Value::String(value), true));
+                    InputKind::Secret => {
+                        let mut value = configured_value.as_str().unwrap_or_default().to_owned();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut value)
+                                    .password(true)
+                                    .hint_text("secret value"),
+                            )
+                            .changed()
+                        {
+                            changes.push((input.key.clone(), Value::String(value)));
                         }
-                        ui.label(RichText::new("name only").small().color(MUTED));
                     }
                 }
             });
         }
-        for (key, value, is_secret) in changes {
-            self.update_extension_value(id, key, value, is_secret);
+        for (key, value) in changes {
+            self.update_extension_value(id, key, value);
         }
     }
 
@@ -1267,38 +1245,14 @@ impl WireTermApp {
         }
     }
 
-    fn extension_secret_ref(&self, id: ItemId, key: &str) -> String {
-        match &self.playlist.item(id).map(|item| &item.source) {
-            Some(PlaylistSource::Extension {
-                named_secret_refs, ..
-            }) => named_secret_refs.get(key).cloned().unwrap_or_default(),
-            _ => String::new(),
-        }
-    }
-
-    fn update_extension_value(&mut self, id: ItemId, key: String, value: Value, is_secret: bool) {
+    fn update_extension_value(&mut self, id: ItemId, key: String, value: Value) {
         let Some(item) = self.playlist.items.iter_mut().find(|item| item.id == id) else {
             return;
         };
-        let PlaylistSource::Extension {
-            settings,
-            named_secret_refs,
-            ..
-        } = &mut item.source
-        else {
+        let PlaylistSource::Extension { settings, .. } = &mut item.source else {
             return;
         };
-        if is_secret {
-            if let Some(value) = value.as_str() {
-                if value.is_empty() {
-                    named_secret_refs.remove(&key);
-                } else {
-                    named_secret_refs.insert(key, value.to_owned());
-                }
-            }
-        } else {
-            settings.insert(key, value);
-        }
+        settings.insert(key, value);
         self.save_playlist();
     }
 
@@ -1440,8 +1394,6 @@ impl WireTermApp {
                         let _ = self.host.refresh_devices();
                     }
                 });
-                ui.separator();
-                self.named_secrets_editor(ui);
                 if self.selected_item.is_some_and(|id| {
                     matches!(
                         self.playlist.item(id).map(|item| &item.source),
@@ -1453,7 +1405,7 @@ impl WireTermApp {
                     ui.label(
                         RichText::new(
                             "One self-describing extension.lua exposes metadata, inputs, and render. \
-                             The host provides bounded HTTP, opaque named-secret bindings, clock, \
+                             The host provides bounded HTTP, clock, \
                              and relative assets. Lua returns fixed 800 × 480 SVG; vectors/text are \
                              palette-mapped and raster assets are dithered before composition.",
                         )
@@ -1477,61 +1429,6 @@ impl WireTermApp {
                     ));
                 }
             });
-    }
-
-    fn named_secrets_editor(&mut self, ui: &mut egui::Ui) {
-        ui.label("Named secrets");
-        ui.label(
-            RichText::new(
-                "MVP values are stored locally without encryption and never stored in Playlist revisions.",
-            )
-            .small()
-            .color(MUTED),
-        );
-        let mut remove = None;
-        for name in &self.secret_names {
-            ui.horizontal(|ui| {
-                ui.label(name);
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(name.clone());
-                }
-            });
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.secret_name_edit)
-                    .desired_width(150.0)
-                    .hint_text("opaque-name"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut *self.secret_value_edit)
-                    .desired_width(210.0)
-                    .password(true)
-                    .hint_text("secret value"),
-            );
-            if ui.small_button("Create / update").clicked() {
-                match self
-                    .secret_store
-                    .set(self.secret_name_edit.trim(), &self.secret_value_edit)
-                {
-                    Ok(()) => {
-                        self.secret_names = self.secret_store.names().unwrap_or_default();
-                        self.secret_value_edit.zeroize();
-                    }
-                    Err(error) => {
-                        self.record_issue("Named secret could not be saved", error.to_string());
-                    }
-                }
-            }
-        });
-        if let Some(name) = remove {
-            match self.secret_store.remove(&name) {
-                Ok(_) => self.secret_names = self.secret_store.names().unwrap_or_default(),
-                Err(error) => {
-                    self.record_issue("Named secret could not be removed", error.to_string());
-                }
-            }
-        }
     }
 }
 
@@ -1590,22 +1487,13 @@ struct RenderedItem {
     frame: Result<PanelFrame, String>,
 }
 
-fn render_item(
-    item: &PlaylistItem,
-    path: &Path,
-    secrets: &SecretStore,
-    cancellation: RenderCancellation,
-) -> RenderedItem {
+fn render_item(item: &PlaylistItem, path: &Path, cancellation: RenderCancellation) -> RenderedItem {
     match &item.source {
         PlaylistSource::Image { .. } | PlaylistSource::ImageFolder { .. } => RenderedItem {
             schema: None,
             frame: prepare_raster_path(path).map_err(|error| error.to_string()),
         },
-        PlaylistSource::Extension {
-            settings,
-            named_secret_refs,
-            ..
-        } => {
+        PlaylistSource::Extension { settings, .. } => {
             let Some(root) = path.parent() else {
                 return RenderedItem {
                     schema: None,
@@ -1615,8 +1503,6 @@ fn render_item(
             let started = Instant::now();
             let host = Arc::new(LiveExtensionHost::new(
                 root.to_path_buf(),
-                named_secret_refs.clone(),
-                secrets.clone(),
                 system_fixture_clock(),
                 started,
                 cancellation,
@@ -1624,16 +1510,10 @@ fn render_item(
             match LoadedExtension::load(path, host) {
                 Ok(extension) => {
                     let schema = Some((extension.metadata.clone(), extension.inputs.clone()));
-                    let available_names = secrets.names().unwrap_or_default();
-                    let frame = validate_extension_configuration(
-                        &extension.inputs,
-                        settings,
-                        named_secret_refs,
-                        &available_names,
-                    )
-                    .and_then(|resolved| extension.render_svg(&resolved))
-                    .and_then(|svg| render_svg_to_panel(&svg, root))
-                    .map_err(|error| error.to_string());
+                    let frame = validate_extension_configuration(&extension.inputs, settings)
+                        .and_then(|resolved| extension.render_svg(&resolved))
+                        .and_then(|svg| render_svg_to_panel(&svg, root))
+                        .map_err(|error| error.to_string());
                     RenderedItem { schema, frame }
                 }
                 Err(error) => RenderedItem {
@@ -1679,7 +1559,6 @@ fn visual_qa_playlist() -> PlaylistRevision {
         PlaylistSource::Extension {
             path: PathBuf::from("examples/weather-extension"),
             settings: BTreeMap::new(),
-            named_secret_refs: BTreeMap::new(),
         },
     );
     playlist

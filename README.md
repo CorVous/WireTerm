@@ -27,8 +27,8 @@ powershell -ExecutionPolicy Bypass -File scripts/package-portable.ps1
 
 Extract the ZIP and run `wireterm.exe`. Windows may show a SmartScreen warning
 because the MVP archive is unsigned. There is no installer or machine-wide
-configuration. WireTerm stores immutable, atomic Playlist and named-secret
-revisions under the adjacent `wireterm-data` folder, so deleting the extracted
+configuration. WireTerm stores immutable, atomic Playlist revisions under the
+adjacent `wireterm-data` folder, so deleting the extracted
 folder removes the executable and all WireTerm-owned state.
 
 On a fresh extraction with no Playlist revision, WireTerm creates revision 1
@@ -86,23 +86,24 @@ assets. The script returns a table with:
 
 - `metadata`: lowercase `id`, display `name`, positive `version`, and optional
   `description`;
-- `inputs`: the script-defined text, number, checkbox, choice, or named-secret
+- `inputs`: the script-defined text, number, checkbox, choice, or masked secret
   settings shown by the editor;
 - `render(context)`: a function that returns valid fixed 800 × 480 SVG.
 
 The Lua sandbox allowlists only coroutine/table/string/UTF-8/math helpers and
 has no direct filesystem, process, environment, package, or network access.
-Its narrow `wireterm` API provides bounded live HTTP requests, opaque
-named-secret bindings, clock reads, and validated relative asset paths.
+Its narrow `wireterm` API provides bounded live HTTP requests, clock reads,
+and validated relative asset paths.
 Response bodies are arbitrary bytes and capped at 5 MiB; request timeouts cap
 at 60 seconds, Lua execution caps at 30 seconds and 64 MiB, and returned SVG
-caps at 2 MiB. Secret values never enter Lua, the Playlist, the UI, or errors.
+caps at 2 MiB. Secret inputs enter Lua like other Extension settings and are
+masked in the editor; WireTerm does not include their values in its errors.
 
 The host app performs HTTP on its bounded render worker, defaults to
 denying redirects, and retains normal TLS certificate and hostname validation.
-MVP named-secret values are stored locally without encryption in adjacent
-immutable revisions and injected only at the final outgoing-header boundary.
-Protect access to the portable folder accordingly. The editor discovers and scaffolds Extensions under
+MVP secret inputs are stored locally without encryption in their Extension
+Playlist Item revisions. Protect access to the portable folder accordingly.
+The editor discovers and scaffolds Extensions under
 `wireterm-data/extensions`; see
 [`docs/extension-author-guide.md`](docs/extension-author-guide.md) and the
 shipped [`examples/http-extension`](examples/http-extension).

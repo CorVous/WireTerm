@@ -19,7 +19,7 @@ local extension = {
     {
       key = "token",
       label = "Weather token",
-      kind = "named_secret",
+      kind = "secret",
       required = true,
     },
   },
@@ -29,7 +29,7 @@ function extension.render(context)
   local response = wireterm.http({
     method = "GET",
     url = "https://weather.example/current?city=" .. context.settings.city,
-    secret_headers = { Authorization = "token" },
+    secret_headers = { Authorization = "Bearer " .. context.settings.token },
     timeout_ms = 15000,
     max_redirects = 0,
   })
@@ -49,17 +49,17 @@ end
 return extension
 ```
 
-Input kinds are `text`, `number`, `checkbox`, `choice`, and `named_secret`.
-Choice inputs include a non-empty `choices` array. Named-secret inputs resolve
-to app-owned references; their values are never placed in Lua settings.
+Input kinds are `text`, `number`, `checkbox`, `choice`, and `secret`.
+Choice inputs include a non-empty `choices` array. Secret inputs are ordinary
+string settings supplied to Lua, but the editor masks them while editing.
 
 ## Host API
 
 - `wireterm.http(request)` accepts a script-chosen method, URL, string headers,
-  opaque `secret_headers` bindings, arbitrary byte-string body, timeout, and
+  sensitive `secret_headers` values, arbitrary byte-string body, timeout, and
   `max_redirects` from 0 to 10. Redirects default to denied. It returns status,
   byte-string headers, and an arbitrary byte-string body. TLS certificate and
-  hostname validation are never disabled. Requests carrying a named-secret
+  hostname validation are never disabled. Requests carrying a sensitive
   header never follow a redirect across scheme, host, or port boundaries.
 - `wireterm.clock()` returns `unix_seconds` and `utc_offset_minutes`.
 - `wireterm.asset(path)` validates a contained relative local path and returns
@@ -85,7 +85,7 @@ Extension text uses only the Inter font bundled with the locked WireTerm
 build. System font discovery is disabled. Unknown family names fall back to
 that bundled face, so output does not depend on fonts installed on Windows.
 
-## Extension library and secrets
+## Extension library and secret inputs
 
 WireTerm discovers direct child folders containing `extension.lua` under the
 adjacent `wireterm-data/extensions` library. The editor can add a discovered
@@ -93,13 +93,13 @@ folder, browse elsewhere, or scaffold an editable HTTP example. The shipped
 example is also in `examples/http-extension` and is exercised against a local
 deterministic HTTP fixture in tests.
 
-Named-secret values are centrally created, updated, and removed in Advanced
-details. Only their opaque names enter Playlist revisions. MVP values are
-stored locally without encryption in immutable revisions under adjacent
-`wireterm-data/secret-revisions`, read only for final HTTP-header injection,
-marked sensitive at the HTTP boundary, and never returned to Lua or included
-in WireTerm diagnostics. Protect access to the portable folder. Deleting it
-removes every WireTerm-owned secret artifact.
+Secret inputs appear beside the Extension's other declared fields and belong
+to that Extension Playlist Item. The editor masks their text, while the value
+is stored without encryption in the Item's immutable Playlist revision and is
+available through `context.settings`. Use `secret_headers` for outgoing
+credential headers so WireTerm marks them sensitive and prevents cross-origin
+redirect forwarding. Protect access to the portable folder; deleting it
+removes the values with the rest of the Playlist data.
 
 `LocalFixtureHost` remains the deterministic unit-test implementation. The
 host app uses `LiveExtensionHost` on its render worker, keeping the egui

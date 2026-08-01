@@ -102,12 +102,13 @@ The minimum start-to-start time assigned to a playlist item. Its timer begins wh
 
 ## Extension capability
 
-A bounded host operation available to an extension script, such as an HTTP request, named-secret binding, clock read, or relative local-asset lookup. Capabilities are mediated by WireTerm and granted independently to each playlist item.
+A bounded host operation available to an extension script, such as an HTTP request, clock read, or relative local-asset lookup. Capabilities are mediated by WireTerm and granted independently to each Playlist Item.
 
-## Named secret
+## Extension secret input
 
-A credential value stored and injected into extension-requested HTTP operations by WireTerm under a script-defined logical name. Extension scripts, response data, logs, errors, and the UI may use references but never receive the value.
+A masked Extension input whose value belongs to one Extension Playlist Item alongside its other settings. It is locally persisted in that Item's Playlist revision and supplied to the Extension script at render time.
+_Avoid_: Named secret, secret binding
 
 ## Extension host API
 
-The narrow WireTerm-owned interface through which an extension script requests bounded HTTP, names credential bindings, reads the clock, and resolves relative local assets. The Lua runtime has no direct filesystem, process, environment, or network access.
+The narrow WireTerm-owned interface through which an extension script requests bounded HTTP, reads the clock, and resolves relative local assets. The Lua runtime has no direct filesystem, process, environment, or network access.

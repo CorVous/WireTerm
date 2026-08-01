@@ -5791,7 +5791,6 @@ dependencies = [
  "serialport",
  "thiserror 2.0.18",
  "tray-icon",
- "zeroize",
 ]
 
 [[package]]
